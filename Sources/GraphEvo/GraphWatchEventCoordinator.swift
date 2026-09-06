@@ -90,7 +90,6 @@ internal final class GraphWatchEventCoordinator {
         let deleted = managedObjects(notification.userInfo?[NSDeletedObjectsKey])
         guard !deleted.isEmpty else { return }
         let envelopes = materialize(deleted, operation: .delete, source: .local)
-        deliverLegacy(envelopes, source: .local)
         pendingLocalDeletions.append(contentsOf: envelopes)
     }
 
@@ -107,9 +106,6 @@ internal final class GraphWatchEventCoordinator {
             source: .local
         )
 
-        deliverLegacy(inserted, source: .local)
-        deliverLegacy(updated, source: .local)
-
         var deleted = pendingLocalDeletions
         pendingLocalDeletions.removeAll()
         let capturedURIs = Set(deleted.map(\.objectURI))
@@ -122,33 +118,24 @@ internal final class GraphWatchEventCoordinator {
 
     private func remoteChange(_ notification: Notification) {
         guard let context else { return }
-        let envelopes: [GraphWatchEventEnvelope]
-        if let records = notification.userInfo?[GraphEvoOrderedRemoteChangesKey] as? [GraphWatchRemoteRecord] {
-            envelopes = records.compactMap { record in
-                let object = context.object(with: record.objectID)
-                return materialize(
-                    [object],
-                    operation: record.operation,
-                    source: .cloud,
-                    transactionIndex: record.transactionIndex,
-                    changeIndex: record.changeIndex
-                ).first
-            }
-        } else {
-            let inserted = materialize(managedObjects(notification.userInfo?[NSInsertedObjectsKey], in: context), operation: .insert, source: .cloud)
-            let updated = materialize(managedObjects(notification.userInfo?[NSUpdatedObjectsKey], in: context), operation: .update, source: .cloud)
-            let deleted = materialize(managedObjects(notification.userInfo?[NSDeletedObjectsKey], in: context), operation: .delete, source: .cloud)
-            envelopes = inserted + updated + deleted
+        if notification.userInfo?[GraphEvoOrderedRemoteChangesKey] != nil {
+            // Legacy Watch instances observe the original notification
+            // directly. The batch path owns materialization and retry for
+            // Persistent History reports, so do not materialize a second
+            // copy here or let a batch failure affect legacy callbacks.
+            cloudDelivery.request()
+            return
         }
 
-        deliverLegacy(envelopes, source: .cloud)
-        if notification.userInfo?[GraphEvoOrderedRemoteChangesKey] != nil {
-            cloudDelivery.request()
-        } else {
-            // Keep direct/simulated notifications useful for tests and local
-            // integrations that do not have a Persistent History token.
-            deliverReport(envelopes, source: .cloud)
-        }
+        let envelopes: [GraphWatchEventEnvelope]
+        let inserted = materialize(managedObjects(notification.userInfo?[NSInsertedObjectsKey], in: context), operation: .insert, source: .cloud)
+        let updated = materialize(managedObjects(notification.userInfo?[NSUpdatedObjectsKey], in: context), operation: .update, source: .cloud)
+        let deleted = materialize(managedObjects(notification.userInfo?[NSDeletedObjectsKey], in: context), operation: .delete, source: .cloud)
+        envelopes = inserted + updated + deleted
+
+        // Direct/simulated notifications do not have a Persistent History
+        // delivery cursor and retain the existing batch behavior.
+        deliverReport(envelopes, source: .cloud)
     }
 
     private func materialize(
@@ -176,12 +163,6 @@ internal final class GraphWatchEventCoordinator {
                 return nil
             }
         }
-    }
-
-    private func deliverLegacy(_ envelopes: [GraphWatchEventEnvelope], source: GraphSource) {
-        guard let graph, !envelopes.isEmpty else { return }
-        graph.watchers.removeAll { !$0.isAlive }
-        graph.watchers.forEach { $0.receiver?.receive(envelopes, source: source) }
     }
 
     private func deliverReport(_ envelopes: [GraphWatchEventEnvelope], source: GraphSource) {

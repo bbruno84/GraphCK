@@ -968,15 +968,24 @@ extension Watch {
   }
   
   /// Prepares the Watch instance.
-  func prepare() {
+    func prepare() {
     prepareGraph()
     resume()
   }
   
   /// Prepares the instance for save notifications.
     func addForObservation() {
-      // Observation is owned once per Graph by GraphWatchEventCoordinator.
-      // Watch remains responsible only for predicate filtering and legacy delivery.
+      guard let moc = graph.managedObjectContext else {
+        return
+      }
+
+      let defaultCenter = NotificationCenter.default
+      defaultCenter.addObserver(self, selector: #selector(notifyInsertedWatchers), name: .NSManagedObjectContextDidSave, object: moc)
+      defaultCenter.addObserver(self, selector: #selector(notifyUpdatedWatchers), name: .NSManagedObjectContextDidSave, object: moc)
+      defaultCenter.addObserver(self, selector: #selector(notifyDeletedWatchers), name: .NSManagedObjectContextObjectsDidChange, object: moc)
+      defaultCenter.addObserver(self, selector: #selector(notifyInsertedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
+      defaultCenter.addObserver(self, selector: #selector(notifyUpdatedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
+      defaultCenter.addObserver(self, selector: #selector(notifyDeletedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
     }
   
   /// Prepares graph for watching.
