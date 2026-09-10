@@ -138,6 +138,10 @@ internal extension Graph {
 
     // Reuse cached context if present
         if let cached = GraphContextRegistry.shared.context(for: storeKey) {
+      guard GraphContextRegistry.shared.isCompatible(key: storeKey, configuration: configuration) else {
+        failStoreOpening(.incompatibleRegisteredStore(storeURL))
+        return
+      }
       managedObjectContext = cached
       contextRegistryKey = storeKey
       persistentContainer = GraphContextRegistry.shared.container(for: storeKey)
@@ -174,6 +178,12 @@ internal extension Graph {
     }
 
     if configuration.cloudKitContainerIdentifier != nil && !Graph.isRunningUnderTests {
+      guard GraphContextRegistry.shared.claimCloudKitStore(key: storeKey) else {
+        failStoreOpening(.cloudKitGraphAlreadyActive)
+        return
+      }
+      cloudKitRegistryClaimed = true
+      contextRegistryKey = storeKey
       let container = GraphStoreContainerFactory.makeCloud(name: name, storeURL: storeURL, configuration: configuration)
       self.persistentContainer = container
       self.installCloudSyncEventObserverIfNeeded(for: container)
@@ -181,6 +191,8 @@ internal extension Graph {
         container.loadPersistentStores { [unowned self] (desc, error) in
           if let error = error {
           self.removeCloudSyncEventObserver()
+          GraphContextRegistry.shared.releaseCloudKitStore(key: storeKey)
+          self.cloudKitRegistryClaimed = false
           emit(.warning(.cloudStoreFallback(underlying: error)))
           // Fallback: try a plain local NSPersistentContainer (no CloudKit) instead of crashing.
           let plain = GraphStoreContainerFactory.makeLocal(name: name, storeURL: storeURL, configuration: configuration)
@@ -331,7 +343,11 @@ internal extension Graph {
   /// Records an opening failure without moving, replacing or recreating the
   /// existing store. The application can inspect the error and migrate the
   /// exact `runtimeStoreURL` itself before trying again.
-  private func failStoreOpening(_ error: GraphStoreOpeningError) {
+  func failStoreOpening(_ error: GraphStoreOpeningError) {
+    if cloudKitRegistryClaimed, let key = contextRegistryKey {
+      GraphContextRegistry.shared.releaseCloudKitStore(key: key)
+      cloudKitRegistryClaimed = false
+    }
     storeOpeningError = error
     managedObjectContext = nil
     persistentContainer = nil
@@ -350,6 +366,12 @@ internal extension Graph {
   func storeDidOpenSuccessfully() {
     guard case .initializing = readiness else { return }
 
+    if let managedObjectContext {
+      watchEventCoordinator = GraphWatchEventCoordinator(graph: self, context: managedObjectContext)
+    }
+
+    if migrationEnabled { GraphMigrationManager.registerKVSObservation(configuration: configuration) }
+
     guard migrationEnabled else {
       completeReadiness()
       return
@@ -362,11 +384,18 @@ internal extension Graph {
     ) { [weak self] in
       guard let self else { return }
       GraphMigrationManager.handlePhase(
-        .ready,
+        .postMigration,
         configuration: self.configuration,
         graph: self
       ) { [weak self] in
-        self?.completeReadiness()
+        guard let self else { return }
+        GraphMigrationManager.handlePhase(
+          .ready,
+          configuration: self.configuration,
+          graph: self
+        ) { [weak self] in
+          self?.completeReadiness()
+        }
       }
     }
   }

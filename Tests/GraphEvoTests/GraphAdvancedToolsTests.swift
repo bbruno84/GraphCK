@@ -2,7 +2,7 @@ import XCTest
 @testable import GraphEvo
 
 final class GraphAdvancedToolsTests: XCTestCase {
-    private struct PreferCanonical: DedupDiscriminator {
+    private struct PreferCanonical: DedupSurvivorSelector {
         func choosePreferred(_ lhs: Entity, _ rhs: Entity) -> Entity {
             let lhsSource = lhs[dynamicMember: "source"] as? String
             return lhsSource == "canonical" ? lhs : rhs
@@ -77,14 +77,15 @@ final class GraphAdvancedToolsTests: XCTestCase {
         duplicate.is(relationship: "knows").object = other
         graph.sync()
 
-        try GraphDedupEngine.deduplicate(
-            in: graph,
-            uuidFieldMap: ["Person": "uuid"],
-            discriminator: PreferCanonical()
+        let dedupConfiguration = GraphDedupConfiguration(
+            keyProvider: UUIDFieldKeyProvider(fields: ["Person": "uuid"]),
+            survivorSelector: PreferCanonical()
         )
+        let report = try GraphDedupEngine.deduplicate(in: graph, configuration: dedupConfiguration)
 
         let people = Search<Entity>(graph: graph).where(.type("Person")).sync()
         XCTAssertEqual(people.count, 2)
+        XCTAssertEqual(report.deletedEntities, 1)
         XCTAssertEqual(
             people.first(where: { ($0[dynamicMember: "uuid"] as? String) == "person-1" })?[dynamicMember: "source"] as? String,
             "canonical"

@@ -6,6 +6,7 @@
 //
 
 import CoreData
+import CloudKit
 
 internal final class GraphContextRegistry {
     static let shared = GraphContextRegistry()
@@ -19,6 +20,7 @@ internal final class GraphContextRegistry {
         let context: NSManagedObjectContext
         let container: NSPersistentContainer?
         var configuration: GraphStoreConfiguration
+        let isCloud: Bool
         var observerOwner: Graph?
         var graphs: [WeakGraph]
 
@@ -31,6 +33,7 @@ internal final class GraphContextRegistry {
             self.context = context
             self.container = container
             self.configuration = configuration
+            self.isCloud = container is NSPersistentCloudKitContainer
             self.observerOwner = nil
             self.graphs = [WeakGraph(graph)]
         }
@@ -39,6 +42,7 @@ internal final class GraphContextRegistry {
     private let lock = NSLock()
     private let storeOpenLock = NSLock()
     private var entries: [String: Entry] = [:]
+    private var cloudKitStoreKey: String?
 
     private init() {}
 
@@ -66,6 +70,35 @@ internal final class GraphContextRegistry {
         lock.lock()
         defer { lock.unlock() }
         return entries.values.first(where: { $0.context === context })?.configuration
+    }
+
+    func isCompatible(key: String, configuration: GraphStoreConfiguration) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[key] else { return true }
+        let requestedCloud = configuration.cloudKitContainerIdentifier != nil
+            && !configuration.disablesCloudKit
+            && !Graph.isRunningUnderTests
+        guard entry.isCloud == requestedCloud else { return false }
+        guard !requestedCloud else {
+            return entry.configuration.cloudKitContainerIdentifier == configuration.cloudKitContainerIdentifier
+                && entry.configuration.environment == configuration.environment
+        }
+        return true
+    }
+
+    func claimCloudKitStore(key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard cloudKitStoreKey == nil || cloudKitStoreKey == key else { return false }
+        cloudKitStoreKey = key
+        return true
+    }
+
+    func releaseCloudKitStore(key: String) {
+        lock.lock()
+        if cloudKitStoreKey == key { cloudKitStoreKey = nil }
+        lock.unlock()
     }
 
     /// Registers a Graph atomically with the store identity.
@@ -109,7 +142,10 @@ internal final class GraphContextRegistry {
         lock.lock()
         defer { lock.unlock() }
 
-        guard let entry = entries[key] else { return nil }
+        guard let entry = entries[key] else {
+            if cloudKitStoreKey == key { cloudKitStoreKey = nil }
+            return nil
+        }
         entry.graphs = entry.graphs.filter { $0.value != nil && $0.value !== graph }
 
         let wasObserverOwner = entry.observerOwner === graph
@@ -121,6 +157,7 @@ internal final class GraphContextRegistry {
         }
 
         entries.removeValue(forKey: key)
+        if cloudKitStoreKey == key { cloudKitStoreKey = nil }
         return nil
     }
 

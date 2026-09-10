@@ -55,22 +55,31 @@ in `uuidFieldMap` are marked as unmapped.
 
 ## Deduplication
 
-`DedupTool` and `GraphDedupEngine` group entities using a type-to-UUID-field map
-and ask `DedupDiscriminator` which item to keep.
+`GraphDedupEngine` groups entities through a `DedupKeyProvider`, selects
+survivors through a `DedupSurvivorSelector`, and merges metadata through a
+non-destructive `DedupMetadataMerger`. `UUIDFieldKeyProvider` provides the
+standard type-to-UUID-field strategy.
 
 ```swift
-struct PreferNewest: DedupDiscriminator {
+struct PreferNewest: DedupSurvivorSelector {
     func choosePreferred(_ lhs: Entity, _ rhs: Entity) -> Entity {
         lhs.createdDate >= rhs.createdDate ? lhs : rhs
     }
 }
 
-try GraphDedupEngine.deduplicate(
+let configuration = GraphDedupConfiguration(
+    keyProvider: UUIDFieldKeyProvider(fields: ["User": "remoteID"]),
+    survivorSelector: PreferNewest()
+)
+
+let report = try GraphDedupEngine.deduplicate(
     in: graph,
-    uuidFieldMap: ["User": "remoteID"],
-    discriminator: PreferNewest()
+    configuration: configuration
 )
 ```
 
-Deduplication may delete objects and change relationships: always create a
-backup and inspect the report before using it on production data.
+The default policy rewires and deduplicates relationships and actions. Metadata
+copies only missing properties and merges tags and groups without duplicates.
+Entities without a key are skipped by default; use `.fail` when every entity
+must be indexed. Deduplication may delete objects and change relationships:
+always create a backup before using it on production data.

@@ -2,7 +2,29 @@
 
 GraphEvo can use `NSPersistentCloudKitContainer` to synchronize a private
 CloudKit store. Synchronization is optional: without a container identifier,
-the graph remains local.
+the graph remains local. GraphEvo derives the signed build environment
+internally and keeps Development and Production stores, ledgers, and KVS
+projections separate; the application continues to provide only a
+`GraphStoreConfiguration`.
+
+When the explicit CloudKit environment entitlement is unavailable in a signed
+iOS product, GraphEvo derives Development from `get-task-allow = true` and
+Production from a distribution signature, after verifying that the signed
+iCloud services include CloudKit. Simulator builds remain Development. The
+application does not configure this distinction.
+
+While a migration-enabled Graph is alive, GraphEvo observes external KVS
+changes for that normalized store. Entries include the logical store scope and
+publication/observation timestamps. Conflicts are ordered deterministically by
+generation, pseudonymous installation ID, then operation ID. Remote state is
+made available to migrations as an observation and never replaces the local
+ledger projection directly.
+
+Migration publication is tracked independently from observation. The
+per-store ledger persists both the last projection accepted by the local KVS
+store and a pending projection to retry. External notifications trigger
+reconciliation through the same environment-aware scope; legacy completion
+keys are promoted only for Production and are ignored in Development.
 
 ## Configuration
 
@@ -124,6 +146,15 @@ GraphEvo cannot replace the app's capability configuration.
 CloudKit changes pass through Persistent History, are merged into the observed
 context, and are then forwarded to watchers with `GraphSource.cloud`. See
 [Persistent History](../migrations/persistent-history.md).
+
+When `Graph.watchReportCompletion` is configured for `.cloud`, the same
+reconstructed events are also delivered as one non-empty report for each
+Persistent History processing cycle. GraphEvo persists the history token after
+filtering and merging, before materializing and delivering the report. The
+completion is not an acknowledgment: delivery never delays or rewinds the
+Persistent History processing token. Batch materialization failures are
+retryable and leave the separate batch-delivery token unchanged; legacy Watch
+callbacks retain their existing best-effort behavior.
 
 In production, keep callbacks idempotent and verify behavior across multiple
 devices: local and remote notifications may arrive at different times.

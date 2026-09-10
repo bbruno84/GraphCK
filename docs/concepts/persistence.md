@@ -38,6 +38,10 @@ strings manually or pass HTTP URLs to Core Data.
 - `storeURL` is the canonical path calculated from the configuration.
 - `resolvedStoreURL` is the path GraphEvo will actually open.
 
+CloudKit-backed directory stores resolve their build environment automatically.
+Development stores use a `-dev` suffix, while Production keeps the existing
+filename. The environment is independent of the user's iCloud account status.
+
 The difference matters when a legacy store exists. The canonical path may not
 exist while `resolvedStoreURL` points to a reused legacy path.
 

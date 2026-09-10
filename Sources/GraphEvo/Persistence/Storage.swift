@@ -100,16 +100,24 @@ extension Graph {
       return
     }
     
+    var success = false
+    var saveError: Error?
+
     persistenceOperationLock.lock()
-    defer { persistenceOperationLock.unlock() }
     moc.performAndWait { [unowned moc] in
       do {
         try moc.save()
-        GraphCompletionCallback(success: true, error: nil, completion: completion)
+        success = true
       } catch let e as NSError {
-        GraphCompletionCallback(success: false, error: e, completion: completion)
+        saveError = e
       }
     }
+
+    // The completion may re-enter GraphEvo (for example, the migration
+    // coordinator records the final ledger state from here). Invoke it only
+    // after both the context operation and the persistence lock have ended.
+    persistenceOperationLock.unlock()
+    GraphCompletionCallback(success: success, error: saveError, completion: completion)
   }
   
   /**

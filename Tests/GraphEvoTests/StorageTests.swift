@@ -29,6 +29,23 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(saved.first?[dynamicMember: "value"] as? String, "saved")
     }
 
+    func testSyncCompletionCanReenterGraphAfterTheSaveReturns() {
+        let graph = makeInMemoryGraph("ReentrantSync")
+        let completed = expectation(description: "reentrant save completed")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            graph.sync { success, error in
+                XCTAssertTrue(success, error?.localizedDescription ?? "")
+                graph.sync { nestedSuccess, nestedError in
+                    XCTAssertTrue(nestedSuccess, nestedError?.localizedDescription ?? "")
+                    completed.fulfill()
+                }
+            }
+        }
+
+        wait(for: [completed], timeout: 5)
+    }
+
     func testClearDeletesEntitiesRelationshipsAndActions() {
         let graph = makeInMemoryGraph("Clear")
         let subject = Entity("ClearEntity", graph: graph)

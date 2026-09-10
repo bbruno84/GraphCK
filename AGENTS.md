@@ -125,6 +125,10 @@ A watcher is initially stopped. Configure its filter and delegate, then call
 `resume()`. Use `pause()` to suspend it and `clear()` to remove the filter.
 Callbacks distinguish `GraphSource.local` and `GraphSource.cloud`.
 
+For Graph-level batches, assign `Graph.watchReportCompletion` and select sources
+with `Graph.watchReportSources`. Batch reports do not apply Watch predicates,
+are delivered on the main thread, and do not disable legacy callbacks.
+
 ## CloudKit and Persistent History
 
 Container identifier precedence is:

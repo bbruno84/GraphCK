@@ -14,6 +14,16 @@ import XCTest
 import CoreData
 
 final class PersistentHistoryTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GraphMigrationManager.resetForTesting()
+    }
+
+    override func tearDown() {
+        GraphMigrationManager.resetForTesting()
+        super.tearDown()
+    }
+
     private struct AppDataVersionMigration: GraphMigration {
         let id = "PersistentHistoryTests.AppDataVersionMigration"
         let version = 1
@@ -72,7 +82,7 @@ final class PersistentHistoryTests: XCTestCase {
 
         // 1. Create a fresh Graph with unique name
         var config = GraphStoreConfiguration()
-        config.name = "TestGraph)"
+        config.name = "PersistentHistory-\(UUID().uuidString)"
         let graph = Graph(configuration: config)
 
         // 2. Insert a ManagedEntityProperty without appDataVersion

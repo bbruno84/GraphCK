@@ -19,6 +19,11 @@ public struct GraphStoreConfiguration {
     public var requiredGraphModelVersion: Int = 1
     public var requiredAppDataVersion: Int = 1
 
+    /// Internal marker used by `Graph(storeURL:)` to force a directly supplied
+    /// SQLite file to remain local, regardless of global CloudKit settings.
+    internal var disablesCloudKit = false
+    internal private(set) var environment: GraphStoreEnvironment? = nil
+
     /// Public default initializer so this type can be used in default argument values.
     public init() {}
 
@@ -40,7 +45,10 @@ public struct GraphStoreConfiguration {
     }
 
     /// Nome file dello store.
-    public var storeFilename: String { "GraphEvo_\(name).sqlite" }
+    public var storeFilename: String {
+        let suffix = environment == .development ? "-dev" : ""
+        return "GraphEvo_\(name)\(suffix).sqlite"
+    }
 
     /// Canonical URL of the store.
     ///
@@ -56,7 +64,14 @@ public struct GraphStoreConfiguration {
 
     /// Route (Local vs Cloud) determined by the presence of a CloudKit container.
     public var route: String {
-        cloudKitContainerIdentifier == nil ? "Local/\(name)" : "Cloud/\(name)"
+        guard cloudKitContainerIdentifier != nil else { return "Local/\(name)" }
+        let environmentName: String
+        switch environment {
+        case .development: environmentName = "Development"
+        case .production: environmentName = "Production"
+        default: environmentName = "Unknown"
+        }
+        return "Cloud/\(environmentName)/\(name)"
     }
 
     /// Convenience versions wrapper.
@@ -70,7 +85,7 @@ public struct GraphStoreConfiguration {
     /// upgrading GraphEvo does not silently create an empty store beside an
     /// existing one.
     public var legacyStoreURLs: [URL] {
-        guard !isExplicitStoreFile else { return [] }
+        guard !isExplicitStoreFile, environment != .development else { return [] }
 
         let directLegacy = resolvedLocation.appendingPathComponent("Graph.sqlite")
         let local = resolvedLocation
@@ -110,6 +125,10 @@ public struct GraphStoreConfiguration {
     /// It identifies the resolved store, not just its public route/name.
     internal var storeIdentityKey: String {
         resolvedStoreURL.standardizedFileURL.path
+    }
+
+    internal mutating func setResolvedEnvironment(_ environment: GraphStoreEnvironment) {
+        self.environment = environment
     }
 
     private var isExplicitStoreFile: Bool {

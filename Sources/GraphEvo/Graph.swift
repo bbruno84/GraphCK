@@ -42,6 +42,9 @@ public enum GraphStoreOpeningError: LocalizedError {
     case incompatibleStore(URL)
     case unreadableStore(URL, underlying: Error)
     case failedToLoadStore(URL, underlying: Error)
+    case cloudKitEnvironmentUnavailable
+    case cloudKitGraphAlreadyActive
+    case incompatibleRegisteredStore(URL)
 
     public var errorDescription: String? {
         switch self {
@@ -51,6 +54,12 @@ public enum GraphStoreOpeningError: LocalizedError {
             return "The store at \(url.path) could not be inspected: \(error.localizedDescription)"
         case .failedToLoadStore(let url, let error):
             return "The store at \(url.path) could not be opened: \(error.localizedDescription)"
+        case .cloudKitEnvironmentUnavailable:
+            return "The CloudKit environment could not be determined for this build."
+        case .cloudKitGraphAlreadyActive:
+            return "A CloudKit Graph is already active in this process."
+        case .incompatibleRegisteredStore(let url):
+            return "The store at \(url.path) is already registered with an incompatible persistence configuration."
         }
     }
 }
@@ -111,6 +120,15 @@ public class Graph: NSObject {
     
     /// Watch instances.
     public internal(set) lazy var watchers : [Watcher] = []
+
+    /// Receives non-empty aggregated change reports on the main thread.
+    public var watchReportCompletion: GraphWatchReportCompletion?
+
+    /// Sources delivered to the batch completion.
+    /// Legacy Watch callbacks are independent and remain active for all sources.
+    public var watchReportSources: Set<GraphSource> = [.local, .cloud]
+
+    internal var watchEventCoordinator: GraphWatchEventCoordinator?
     
     /// Optional delegate to receive iCloud availability updates (informational).
     public weak var cloudStatusDelegate: GraphCloudStatusDelegate? {
@@ -159,7 +177,9 @@ public class Graph: NSObject {
         runtimeOverride: String?,
         infoPlistValue: String? = Bundle.main.object(forInfoDictionaryKey: "GraphCloudKitContainerIdentifier") as? String
     ) -> String? {
-        [configuration.cloudKitContainerIdentifier, runtimeOverride, infoPlistValue]
+        guard !configuration.disablesCloudKit else { return nil }
+        let candidates: [String?] = [configuration.cloudKitContainerIdentifier, runtimeOverride, infoPlistValue]
+        return candidates
             .compactMap { value in
                 guard let value else { return nil }
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -208,6 +228,7 @@ public class Graph: NSObject {
 
     /// Stable registry key captured when the store is opened.
     internal var contextRegistryKey: String?
+    internal var cloudKitRegistryClaimed = false
     
     /**
      A reference to the graph completion handler.
@@ -221,6 +242,7 @@ public class Graph: NSObject {
     
     /// Deinitializer that removes the Graph from NSNotificationCenter.
     deinit {
+        if migrationEnabled { GraphMigrationManager.unregisterKVSObservation(configuration: configuration) }
         removeCloudSyncEventObserver()
         if let key = contextRegistryKey,
            let promoted = GraphContextRegistry.shared.release(graph: self, key: key) {
@@ -236,13 +258,21 @@ public class Graph: NSObject {
             configuration: configuration,
             runtimeOverride: Self.cloudKitContainerIdentifier
         )
+        let environmentResult = GraphStoreEnvironmentResolver.resolve(configuration: resolvedConfiguration)
+        if case .success(let environment) = environmentResult {
+            resolvedConfiguration.setResolvedEnvironment(environment)
+        }
         self.configuration = resolvedConfiguration
         self.migrationEnabled = migrationEnabled
         GraphValueTransformer.register()
+        super.init()
+        if case .failure(let error) = environmentResult {
+            failStoreOpening(error)
+            return
+        }
         if migrationEnabled {
             GraphMigrationManager.handlePhase(.preInit, configuration: resolvedConfiguration, graph: nil)
         }
-        super.init()
         observeRemoteStoreChanges()
         checkICloudAccountStatus()
         prepareGraphContextRegistry()
@@ -331,6 +361,7 @@ public class Graph: NSObject {
         config.name = resolvedName
         config.backend = backend
         config.location = resolvedLocation
+        config.disablesCloudKit = true
         
         self.init(configuration: config, migrationEnabled: migrationEnabled)
     }

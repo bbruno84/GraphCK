@@ -45,6 +45,13 @@ Important calculated properties include:
 - `legacyStoreURLs`: candidate legacy paths;
 - `resolvedStoreURL`: the URL actually selected for opening.
 
+GraphEvo internally identifies whether the resolved store is for CloudKit
+Development, CloudKit Production, or local persistence. Directory-based
+CloudKit stores select the environment automatically; Development stores use a
+`-dev` filename suffix. `Graph(storeURL:)` always uses local persistence. The
+environment and its scope are implementation details and are not part of the
+application-facing API.
+
 For `.inMemory`, URLs are still calculated for consistency but do not identify a
 persistent file. `appGroupIdentifier` affects directory-based configurations;
 it does not move an explicit SQLite file.
@@ -58,6 +65,10 @@ public init(storeURL: URL,
             backend: GraphStoreBackend = .sqlite,
             migrationEnabled: Bool = true)
 ```
+
+`Graph(storeURL:)` always opens the supplied store as local persistence. It
+does not inherit a CloudKit container identifier from `Graph`, configuration,
+or `Info.plist`.
 
 `Graph` opens a store and owns the Core Data context used by the public facades.
 Use `whenReady` when opening must be coordinated explicitly:
@@ -87,8 +98,9 @@ public enum GraphReadiness {
 }
 ```
 
-`GraphStoreOpeningError` includes incompatible, unreadable, and failed-to-load
-store cases. An incompatible store is not changed automatically.
+`GraphStoreOpeningError` includes incompatible, unreadable, failed-to-load,
+environment, registry-conflict, and incompatible-registered-store cases. An
+incompatible store is not changed automatically.
 
 ## 4. Nodes and domain objects
 
@@ -197,6 +209,44 @@ Callbacks cover insertion, update, deletion, property changes, tag changes, and
 group membership changes. `GraphSource.local` and `.cloud` identify the change
 source.
 
+### Aggregated Watch reports
+
+`Graph` also exposes an optional Graph-level batch path. It does not inherit or
+apply predicates from individual `Watch` instances:
+
+```swift
+public enum GraphWatchEvent { /* typed Entity, Relationship, and Action cases */ }
+
+public final class GraphWatchReport {
+    public let graph: Graph
+    public let source: GraphSource
+    public let events: [GraphWatchEvent]
+}
+
+public typealias GraphWatchReportCompletion = (_ report: GraphWatchReport?, _ error: Error?) -> Void
+
+public var Graph.watchReportCompletion: GraphWatchReportCompletion?
+public var Graph.watchReportSources: Set<GraphSource>
+```
+
+`GraphWatchEvent` has one case for every atomic Watch callback: node insertion
+and deletion, relationship update, and property, tag, and group addition,
+update, or removal for the supported node family. Deleted events retain the
+same `Entity`, `Relationship`, or `Action` wrappers used by legacy Watch.
+
+Reports are non-empty, immutable, and delivered on the main thread. They are
+not `Sendable`; their objects remain tied to the Graph managed object context.
+The completion receives `(report, nil)` after a successful delivery. Structural
+failures receive `(nil, error)`. A Persistent History retention gap may produce
+`(report, error)` for best-effort delivery. Materialization failures are
+retryable: no completion is called and the batch delivery token remains
+unchanged. The default source set is `[.local, .cloud]`. Restrict it before
+assigning the completion when only one source is wanted.
+
+Batch reporting and legacy watchers are parallel. Enabling reports does not
+disable atomic callbacks, so applications must not process both paths as the
+same logical consumer unless duplicate handling is intentional.
+
 ## 7. Events and CloudKit
 
 ```swift
@@ -206,6 +256,8 @@ public enum GraphEvent {
     case warning(GraphWarning)
     case error(GraphFailure)
 }
+// GraphFailure additionally reports watchEventMaterialization when one
+// change cannot be represented while the remaining batch continues.
 public enum GraphCloudImportState {
     case started(GraphCloudImportEvent)
     case finished(GraphCloudImportEvent)
@@ -281,13 +333,41 @@ GraphMigrationManager.registerMigration(migration)
 ```
 
 Lifecycle phases are `.preInit`, `.postInit`, `.postMigration`, and `.ready`.
-Registration is once per migration ID and follows registration order.
+Graph executes all four phases automatically in that order. Registration is
+once per migration ID and follows registration order.
 
 `GraphMigrationResult` includes `.done`, `.error(Error)`, `.fallback`, and
 `.skipped`. `GraphMigrationContext` passes values between phases and exposes
-`previousMigrationRecord`. The ledger records `started`, `done`, and `failed`
-states. Application migration errors are delivered as
-`GraphFailure.migration`.
+`previousMigrationRecord` and `migrationStateSnapshot`. The snapshot supports
+idempotent recovery decisions after an interrupted attempt. The versioned ledger records `started`, `done`,
+`notRequired`, `notExecuted`, and `failed` states. Runtime queues and contexts
+are isolated per normalized store scope; applications continue to provide only
+a `GraphStoreConfiguration`.
+
+`GraphMigrationManager` also supports `record(for:configuration:)` and the
+throwing `recordThrowing(for:configuration:)`. Diagnostic clients can read
+immutable history and state snapshots through `history(for:configuration:)`
+and `stateSnapshot(for:configuration:)`. It also supports
+`resetRecord(for:configuration:)`, the additive reset overload accepting
+multiple targets, requester and reason, and
+`forceMigration(_:configuration:requestedBy:reason:)` for a one-shot local
+force request. `GraphMigrationRequestedBy` includes `.system`,
+`.migrationManager`, `.supportCenter`, `.user`, and `.recovery`.
+Reset and force requests preserve ledger history. Application migration errors
+are delivered as `GraphFailure.migration`; environment routing, scope keys, and
+KVS projection details remain internal to GraphEvo.
+
+`GraphMigrationLedgerEntry` is a public, immutable, `Codable` diagnostic value.
+It includes the migration state, phase, operation and generation identifiers,
+request origin, pseudonymous device identifier, application and model versions,
+backup reference, decision metadata, source, timestamps, store scope, and any
+error or reset reason. `GraphMigrationDecisionReason` and
+`GraphMigrationDecisionSource` are public supporting enums.
+
+The internal schema-1 ledger keeps its current projection separate from its
+append-only history and transaction journal. Recovery is driven by the
+`migrationStateSnapshot` passed to `needsRun`; an interrupted attempt is
+evaluated in its originally recorded lifecycle phase.
 
 `MigrationBackupManager` backs up SQLite files and their optional WAL/SHM
 sidecars. `ConflictPolicy` supports `.duplicate`, `.skip`, and `.overwrite`.
@@ -311,10 +391,15 @@ replace semantic data migrations.
 relationships and actions, and returns `GraphMergeReport`. Imported entities
 receive a `source` property.
 
-`GraphDedupEngine.deduplicate(in:uuidFieldMap:discriminator:)` and `DedupTool`
-deduplicate entities using logical UUID fields and a
-`DedupDiscriminator`. These operations may delete objects and rewrite
-relationships; create a backup first.
+`GraphDedupEngine.deduplicate(in:configuration:)` is the general-purpose
+deduplication entry point. Configure a `DedupKeyProvider`, a
+`DedupSurvivorSelector`, and, when needed, a custom `DedupMetadataMerger`.
+`UUIDFieldKeyProvider` supplies the standard UUID-field strategy.
+
+The default link policy rewires and deduplicates both relationships and
+actions. Metadata copies only missing properties and merges tags and groups
+without duplicates. The engine may delete objects and rewrite links; create a
+backup before running it on production data.
 
 ## 12. Unsupported implementation details
 

@@ -24,9 +24,31 @@ public struct GraphMigrationContext {
     }
 }
 
+public enum GraphMigrationRemoteState: Sendable {
+    case unknown
+    case observed(GraphMigrationRecord)
+}
+
+public struct GraphMigrationStateSnapshot: Sendable {
+    public let storeScope: String
+    public let localRecord: GraphMigrationRecord?
+    public let remoteState: GraphMigrationRemoteState
+    public let generation: UInt64?
+    public let operationID: String?
+    public let phase: String?
+    public let backupReference: String?
+    public let errorDescription: String?
+    public let attemptCount: Int
+    public let interrupted: Bool
+}
+
 public extension GraphMigrationContext {
     var previousMigrationRecord: GraphMigrationRecord? {
         self["GraphMigration.previousRecord"]
+    }
+
+    var migrationStateSnapshot: GraphMigrationStateSnapshot? {
+        self["GraphMigration.stateSnapshot"]
     }
 }
 

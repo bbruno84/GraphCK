@@ -351,6 +351,7 @@ internal extension Graph {
 
             // Request: all transactions after the latest known token.
             let token: NSPersistentHistoryToken? = self._ph_lastToken
+            self.watchEventCoordinator?.prepareCloudDelivery(startingAfter: token)
             let request: NSPersistentHistoryChangeRequest = NSPersistentHistoryChangeRequest.fetchHistory(after: token)
 
             // Note: no SQL filter on `storeID`.
@@ -365,15 +366,24 @@ internal extension Graph {
                     return
                 }
 
-                let orderedTransactions = transactions.sorted { $0.timestamp < $1.timestamp }
+                let orderedTransactions = transactions.enumerated().sorted { lhs, rhs in
+                    if lhs.element.transactionNumber != rhs.element.transactionNumber {
+                        return lhs.element.transactionNumber < rhs.element.transactionNumber
+                    }
+                    if lhs.element.timestamp != rhs.element.timestamp {
+                        return lhs.element.timestamp < rhs.element.timestamp
+                    }
+                    return lhs.offset < rhs.offset
+                }.map(\.element)
 
 
                 // Collect ObjectIDs by change type.
                 var insertedIDs: [NSManagedObjectID] = []
                 var updatedIDs:  [NSManagedObjectID] = []
                 var deletedIDs:  [NSManagedObjectID] = []
+                var orderedRecords: [GraphWatchRemoteRecord] = []
 
-                for tx in orderedTransactions {
+                for (transactionIndex, tx) in orderedTransactions.enumerated() {
                     // 🔒 Author-filter hardening: avoid a duplicate callback on the originating device.
                     if _ph_filterLocalWrites {
                         if let author = tx.author {
@@ -387,11 +397,27 @@ internal extension Graph {
                         }
                     }
 
-                    tx.changes?.forEach { change in
+                    let changes = (tx.changes ?? []).enumerated().sorted { lhs, rhs in
+                        let leftType = lhs.element.changeType.rawValue
+                        let rightType = rhs.element.changeType.rawValue
+                        if leftType != rightType { return leftType < rightType }
+                        let leftURI = lhs.element.changedObjectID.uriRepresentation().absoluteString
+                        let rightURI = rhs.element.changedObjectID.uriRepresentation().absoluteString
+                        if leftURI != rightURI { return leftURI < rightURI }
+                        return lhs.offset < rhs.offset
+                    }.map(\.element)
+
+                    changes.enumerated().forEach { changeIndex, change in
                         switch change.changeType {
-                        case .insert: insertedIDs.append(change.changedObjectID)
-                        case .update: updatedIDs.append(change.changedObjectID)
-                        case .delete: deletedIDs.append(change.changedObjectID)
+                        case .insert:
+                            insertedIDs.append(change.changedObjectID)
+                            orderedRecords.append(GraphWatchRemoteRecord(objectID: change.changedObjectID, operation: .insert, transactionIndex: transactionIndex, changeIndex: changeIndex))
+                        case .update:
+                            updatedIDs.append(change.changedObjectID)
+                            orderedRecords.append(GraphWatchRemoteRecord(objectID: change.changedObjectID, operation: .update, transactionIndex: transactionIndex, changeIndex: changeIndex))
+                        case .delete:
+                            deletedIDs.append(change.changedObjectID)
+                            orderedRecords.append(GraphWatchRemoteRecord(objectID: change.changedObjectID, operation: .delete, transactionIndex: transactionIndex, changeIndex: changeIndex))
                         @unknown default: break
                         }
                     }
@@ -409,7 +435,8 @@ internal extension Graph {
                 let userInfo: [AnyHashable: Any] = [
                     NSInsertedObjectsKey: NSSet(array: insertedIDs),
                     NSUpdatedObjectsKey:  NSSet(array: updatedIDs),
-                    NSDeletedObjectsKey:  NSSet(array: deletedIDs)
+                    NSDeletedObjectsKey:  NSSet(array: deletedIDs),
+                    GraphEvoOrderedRemoteChangesKey: orderedRecords
                 ]
 
                 // Core Data's merge API expects object-ID keys, while the
@@ -437,13 +464,15 @@ internal extension Graph {
                 // Watch observers. This is the consistency barrier missing from
                 // the previous implementation.
                 let targetMOC = self.managedObjectContext ?? container.viewContext
-                targetMOC.performAndWait {
-                    let mergedNotification = Notification(
-                        name: .GraphEvoSimulatedRemoteChange,
-                        object: targetMOC,
-                        userInfo: mergeUserInfo
-                    )
-                    targetMOC.mergeChanges(fromContextDidSave: mergedNotification)
+                GraphWatchLocalCapture.whileSuppressed(targetMOC) {
+                    targetMOC.performAndWait {
+                        let mergedNotification = Notification(
+                            name: .GraphEvoSimulatedRemoteChange,
+                            object: targetMOC,
+                            userInfo: mergeUserInfo
+                        )
+                        targetMOC.mergeChanges(fromContextDidSave: mergedNotification)
+                    }
                 }
 
                 // Persist the token only after the observed context has been
@@ -599,6 +628,13 @@ private extension Graph {
         _ph_tokenStore.save(token)
         _ph_tokenStore.saveBackup(token)
         _ph_isColdStartSession = false
+    }
+
+}
+
+internal extension Graph {
+    func ph_processingTokenForWatchDelivery() -> NSPersistentHistoryToken? {
+        _ph_lastToken ?? _ph_tokenStore.load()
     }
 }
 
