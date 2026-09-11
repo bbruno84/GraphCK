@@ -392,6 +392,16 @@ updates are delivered through `GraphEventDelegate`.
 
 ## 8. Persistent History
 
+`Graph.resetLocalStore(configuration:beforeReset:)` is a pre-open local-replica
+reset. It normalizes configuration and refuses an in-process registered Graph
+under the store-opening lock. The required throwing callback receives the exact
+URL so the caller can back up and persist its scoped intent first. Callback
+failure leaves the store untouched. Do not open a Graph from that callback.
+Destruction uses Core Data's SQLite API with force-destruction disabled, preserving
+its lock/journal handling; errors propagate. No CloudKit container is created and
+no remote deletion is sent. Applications own restart, durable reset recovery,
+backup verification and preventing replay of historical migration sources.
+
 ```swift
 @objc func ph_prepareOnLaunchAfterContainerReady()
 func processPersistentHistoryForRemoteChange()

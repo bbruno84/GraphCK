@@ -64,6 +64,17 @@ contract, `GraphCloudStatusDelegate`.
 
 ## Remote store purge
 
+For a user-requested rebuild **from** CloudKit, use the separate pre-open
+`Graph.resetLocalStore(configuration:beforeReset:)` API after arranging a
+verified backup and durable one-shot intent. It destroys only the local replica
+through Core Data, without a CloudKit container or remote purge. Registered
+Graphs and SQLite writer locks prevent reset; errors are not forced through.
+Reopen the same CloudKit configuration afterward and allow its normal import.
+The app must prevent old migration backups from repopulating the rebuilt store.
+See Apple's [local-store destruction API](https://developer.apple.com/documentation/coredata/nspersistentstorecoordinator/destroypersistentstore(at:type:options:))
+and [unsafe force-destruction option](https://developer.apple.com/documentation/coredata/nspersistentstoreforcedestroyoption),
+which this wrapper explicitly disables.
+
 Administrative tools can ask GraphEvo to delete the Core Data zone from the
 private CloudKit database:
 
