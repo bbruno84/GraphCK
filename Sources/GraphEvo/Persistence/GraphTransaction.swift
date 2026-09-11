@@ -105,6 +105,16 @@ public struct GraphTransactionDiagnostics {
 }
 
 extension Graph {
+    /// Call on the context queue, only with IDs from committed history/save
+    /// notifications. Faulting a removed row can leave an empty deletion pending.
+    /// Never persist inserts, updates, or deletions unrelated to that batch.
+    internal static func finalizePersistedDeletions(in context: NSManagedObjectContext, ids: Set<NSManagedObjectID>) throws {
+        guard context.insertedObjects.isEmpty, context.updatedObjects.isEmpty,
+              !context.deletedObjects.isEmpty,
+              context.deletedObjects.allSatisfy({ ids.contains($0.objectID) && $0.changedValues().isEmpty }) else { return }
+        try GraphWatchLocalCapture.whileSuppressed(context) { try context.save() }
+    }
+
 #if DEBUG
     /// Read-only, payload-bearing diagnostic for application-owned test logs.
     /// Does not save, roll back, obtain permanent IDs or process pending changes.
@@ -208,11 +218,7 @@ extension Graph {
                     // deferred automatic merge would make them pending again.
                     // SQLite regression tests verify this finalization adds no
                     // second persistent-history transaction.
-                    if view.insertedObjects.isEmpty, view.updatedObjects.isEmpty,
-                       !view.deletedObjects.isEmpty,
-                       view.deletedObjects.allSatisfy({ deletedIDs.contains($0.objectID) && $0.changedValues().isEmpty }) {
-                        try view.save()
-                    }
+                    try Self.finalizePersistedDeletions(in: view, ids: deletedIDs)
                 }
             }
         } catch {

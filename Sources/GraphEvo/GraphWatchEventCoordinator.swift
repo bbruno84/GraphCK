@@ -16,17 +16,17 @@ internal enum GraphWatchLocalCapture {
         return suppressedContexts.contains(ObjectIdentifier(context))
     }
 
-    static func whileSuppressed(_ context: NSManagedObjectContext, _ body: () -> Void) {
+    static func whileSuppressed(_ context: NSManagedObjectContext, _ body: () throws -> Void) rethrows {
         let identifier = ObjectIdentifier(context)
         lock.lock()
-        suppressedContexts.insert(identifier)
+        let inserted = suppressedContexts.insert(identifier).inserted
         lock.unlock()
         defer {
             lock.lock()
-            suppressedContexts.remove(identifier)
+            if inserted { suppressedContexts.remove(identifier) }
             lock.unlock()
         }
-        body()
+        try body()
     }
 }
 

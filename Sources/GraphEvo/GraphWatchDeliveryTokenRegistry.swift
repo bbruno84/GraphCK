@@ -158,19 +158,20 @@ internal final class GraphWatchBatchDeliveryCoordinator {
                     return
                 }
                 let target = context
-                GraphWatchLocalCapture.whileSuppressed(target) {
-                    target.performAndWait {
+                try GraphWatchLocalCapture.whileSuppressed(target) {
+                    try target.performAndWait {
                         let mergeInfo: [AnyHashable: Any] = [
                             NSInsertedObjectIDsKey: NSSet(array: fetched.inserted),
                             NSUpdatedObjectIDsKey: NSSet(array: fetched.updated),
                             NSDeletedObjectIDsKey: NSSet(array: fetched.deleted)
                         ]
                         target.mergeChanges(fromContextDidSave: Notification(name: .GraphEvoSimulatedRemoteChange, object: target, userInfo: mergeInfo))
+                        try Graph.finalizePersistedDeletions(in: target, ids: Set(fetched.deleted))
                     }
                 }
                 var envelopes: [GraphWatchEventEnvelope] = []
                 var issues: [GraphWatchMaterializationIssue] = []
-                target.performAndWait {
+                try target.performAndWait {
                     for record in fetched.records {
                         let object = target.object(with: record.objectID)
                         do {
@@ -181,6 +182,7 @@ internal final class GraphWatchBatchDeliveryCoordinator {
                             issues.append(GraphWatchMaterializationIssue(eventKind: record.operation.diagnosticName, objectReference: redactedReference(object), error: error))
                         }
                     }
+                    try Graph.finalizePersistedDeletions(in: target, ids: Set(fetched.deleted))
                 }
                 if !issues.isEmpty && !fetched.historyGap {
                     graph.emit(.warning(.watchReportMaterializationFailed(source: .cloud, failedEvents: issues.count, details: issues)))
@@ -221,7 +223,7 @@ internal final class GraphWatchBatchDeliveryCoordinator {
                 finishWith(report: nil, error: GraphWatchDeliveryError.historyGap(underlying: original))
                 return
             }
-            merge(fetched, into: context)
+            try merge(fetched, into: context)
             // Re-enter the normal materialization path with the retained history.
             materializeAndDeliver(fetched, context: context)
         } catch {
@@ -233,15 +235,21 @@ internal final class GraphWatchBatchDeliveryCoordinator {
         guard let graph else { return }
         var envelopes: [GraphWatchEventEnvelope] = []
         var issues: [GraphWatchMaterializationIssue] = []
-        context.performAndWait {
-            for record in fetched.records {
-                let object = context.object(with: record.objectID)
-                do {
-                    if let envelope = try GraphWatchEventMaterializer.materialize(object: object, operation: record.operation, source: .cloud, transactionIndex: record.transactionIndex, changeIndex: record.changeIndex) { envelopes.append(envelope) }
-                } catch {
-                    issues.append(GraphWatchMaterializationIssue(eventKind: record.operation.diagnosticName, objectReference: redactedReference(object), error: error))
+        do {
+            try context.performAndWait {
+                for record in fetched.records {
+                    let object = context.object(with: record.objectID)
+                    do {
+                        if let envelope = try GraphWatchEventMaterializer.materialize(object: object, operation: record.operation, source: .cloud, transactionIndex: record.transactionIndex, changeIndex: record.changeIndex) { envelopes.append(envelope) }
+                    } catch {
+                        issues.append(GraphWatchMaterializationIssue(eventKind: record.operation.diagnosticName, objectReference: redactedReference(object), error: error))
+                    }
                 }
+                try Graph.finalizePersistedDeletions(in: context, ids: Set(fetched.deleted))
             }
+        } catch {
+            finishStructural(error)
+            return
         }
         if !issues.isEmpty {
             graph.emit(.warning(.watchReportMaterializationFailed(source: .cloud, failedEvents: issues.count, details: issues)))
@@ -263,9 +271,9 @@ internal final class GraphWatchBatchDeliveryCoordinator {
         } catch { finishStructural(error) }
     }
 
-    private func merge(_ fetched: FetchedHistory, into context: NSManagedObjectContext) {
-        GraphWatchLocalCapture.whileSuppressed(context) {
-            context.performAndWait {
+    private func merge(_ fetched: FetchedHistory, into context: NSManagedObjectContext) throws {
+        try GraphWatchLocalCapture.whileSuppressed(context) {
+            try context.performAndWait {
                 let mergeInfo: [AnyHashable: Any] = [
                     NSInsertedObjectIDsKey: NSSet(array: fetched.inserted),
                     NSUpdatedObjectIDsKey: NSSet(array: fetched.updated),
@@ -276,6 +284,7 @@ internal final class GraphWatchBatchDeliveryCoordinator {
                     object: context,
                     userInfo: mergeInfo
                 ))
+                try Graph.finalizePersistedDeletions(in: context, ids: Set(fetched.deleted))
             }
         }
     }

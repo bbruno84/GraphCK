@@ -335,9 +335,8 @@ internal extension Graph {
     /// Processes one history snapshot. The completion is called after the
     /// merged notification has been delivered to existing Watch observers.
     func processPersistentHistoryBatch(completion: @escaping (Bool) -> Void) {
-        // A remote purge invalidates the local object graph and history token.
-        // The application is responsible for reopening the store afterwards;
-        // do not publish the purge's remote notification as normal data.
+        // Pause history delivery during a purge. The purge resets the view
+        // context on completion; keep the store and history metadata intact.
         guard !isCloudPurgeInProgress else { completion(false); return }
         guard let container = persistentContainer else { completion(false); return }
         let psc = container.persistentStoreCoordinator
@@ -464,14 +463,15 @@ internal extension Graph {
                 // Watch observers. This is the consistency barrier missing from
                 // the previous implementation.
                 let targetMOC = self.managedObjectContext ?? container.viewContext
-                GraphWatchLocalCapture.whileSuppressed(targetMOC) {
-                    targetMOC.performAndWait {
+                try GraphWatchLocalCapture.whileSuppressed(targetMOC) {
+                    try targetMOC.performAndWait {
                         let mergedNotification = Notification(
                             name: .GraphEvoSimulatedRemoteChange,
                             object: targetMOC,
                             userInfo: mergeUserInfo
                         )
                         targetMOC.mergeChanges(fromContextDidSave: mergedNotification)
+                        try Self.finalizePersistedDeletions(in: targetMOC, ids: Set(deletedIDs))
                     }
                 }
 
@@ -494,6 +494,15 @@ internal extension Graph {
                         object: targetMOC,
                         userInfo: deliveredUserInfo
                     )
+                    do {
+                        try targetMOC.performAndWait {
+                            try Self.finalizePersistedDeletions(in: targetMOC, ids: Set(deletedIDs))
+                        }
+                    } catch {
+                        self.emit(.error(.persistentHistory(underlying: error)))
+                        completion(false)
+                        return
+                    }
                     completion(true)
                 }
             } catch {
