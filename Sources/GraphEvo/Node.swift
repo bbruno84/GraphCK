@@ -153,6 +153,13 @@ public class Node: NSObject, Codable {
   public var createdDate: Date {
     return node.performAndWait { $0.createdDate }
   }
+
+  /// Preserves a known creation timestamp during application reconciliation,
+  /// without replacing this node's persistent identity. Persist with sync or
+  /// the enclosing Graph transaction.
+  public func setCreatedDate(_ date: Date) {
+    node.performAndWait { $0.createdDate = date }
+  }
   
   /// A reference to tags.
   public var tags: [String] {

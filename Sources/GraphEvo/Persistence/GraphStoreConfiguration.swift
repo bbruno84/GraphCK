@@ -18,11 +18,25 @@ public struct GraphStoreConfiguration {
     public var cloudKitContainerIdentifier: String? = nil
     public var requiredGraphModelVersion: Int = 1
     public var requiredAppDataVersion: Int = 1
+    /// Opt-in: wait for pre-init work before opening any persistent store and
+    /// fail readiness if any application migration phase fails.
+    public var waitsForApplicationMigrations = false
 
     /// Internal marker used by `Graph(storeURL:)` to force a directly supplied
     /// SQLite file to remain local, regardless of global CloudKit settings.
     internal var disablesCloudKit = false
-    internal private(set) var environment: GraphStoreEnvironment? = nil
+    public private(set) var environment: GraphStoreEnvironment? = nil
+
+    /// Returns the same environment-normalized configuration used by Graph
+    /// opening and migration ledgers, without opening or modifying a store.
+    /// The signed environment cannot be overridden by applications.
+    public func resolvingEnvironment() throws -> GraphStoreConfiguration {
+        var result = self
+        result.cloudKitContainerIdentifier = Graph.resolvedCloudKitContainerIdentifier(
+            configuration: self, runtimeOverride: Graph.cloudKitContainerIdentifier)
+        result.environment = try GraphStoreEnvironmentResolver.resolve(configuration: result).get()
+        return result
+    }
 
     /// Public default initializer so this type can be used in default argument values.
     public init() {}

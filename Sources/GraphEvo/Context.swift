@@ -377,6 +377,11 @@ internal extension Graph {
       return
     }
 
+    if configuration.waitsForApplicationMigrations {
+      runRequiredMigrationPhases([.postInit, .postMigration, .ready])
+      return
+    }
+
     GraphMigrationManager.handlePhase(
       .postInit,
       configuration: configuration,
@@ -395,6 +400,19 @@ internal extension Graph {
           graph: self
         ) { [weak self] in
           self?.completeReadiness()
+        }
+      }
+    }
+  }
+
+  private func runRequiredMigrationPhases(_ phases: [GraphMigrationManager.GraphLifecyclePhase]) {
+    guard let phase = phases.first else { completeReadiness(); return }
+    GraphMigrationManager.handlePhaseResult(phase, configuration: configuration, graph: self) { [weak self] result in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        switch result {
+        case .success: self.runRequiredMigrationPhases(Array(phases.dropFirst()))
+        case .failure(let error): self.failStoreOpening(.applicationMigrationFailed(underlying: error))
         }
       }
     }

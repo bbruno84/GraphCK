@@ -332,14 +332,7 @@ public final class GraphMigrationManager {
     }
 
     static func normalizedConfigurationThrowing(_ configuration: GraphStoreConfiguration) throws -> GraphStoreConfiguration {
-        var result = configuration
-        result.cloudKitContainerIdentifier = Graph.resolvedCloudKitContainerIdentifier(
-            configuration: configuration,
-            runtimeOverride: Graph.cloudKitContainerIdentifier
-        )
-        let environment = try GraphStoreEnvironmentResolver.resolve(configuration: result).get()
-        result.setResolvedEnvironment(environment)
-        return result
+        try configuration.resolvingEnvironment()
     }
 
     /// Executes all callbacks and registered migrations for the specified lifecycle phase, running migrations in sequence.
@@ -361,7 +354,21 @@ public final class GraphMigrationManager {
         graph: Graph?,
         completion: (() -> Void)?
     ) {
+        handlePhaseResult(phase, configuration: configuration, graph: graph) { _ in completion?() }
+    }
+
+    /// Runs a phase and reports migration/ledger failures rather than treating
+    /// completion as proof of success. Existing completion-only callers retain
+    /// their diagnostic-only failure behavior.
+    public static func handlePhaseResult(
+        _ phase: GraphLifecyclePhase,
+        configuration: GraphStoreConfiguration?,
+        graph: Graph?,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         guard let inputConfiguration = configuration else {
+            completion(.failure(NSError(domain: "GraphEvo.Migration", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Missing migration configuration."])))
             return
         }
         let configuration = normalizedConfiguration(inputConfiguration)

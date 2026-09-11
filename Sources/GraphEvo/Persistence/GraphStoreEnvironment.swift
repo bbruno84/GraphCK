@@ -19,7 +19,7 @@ private func graphSecTaskCopyValueForEntitlement(
 #endif
 
 /// The persistence environment selected for a Graph store.
-internal enum GraphStoreEnvironment: String, Codable, Equatable, Sendable {
+public enum GraphStoreEnvironment: String, Codable, Equatable, Sendable {
     case development
     case production
     case local

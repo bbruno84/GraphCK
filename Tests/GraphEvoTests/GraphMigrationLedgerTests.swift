@@ -279,6 +279,34 @@ final class GraphMigrationLedgerTests: XCTestCase {
         XCTAssertEqual(history.last?.decisionReason, .remoteDone)
     }
 
+    func testMainAndBackgroundCommitsPreserveEveryHistoryEntry() throws {
+        let configuration = self.configuration!
+        let finished = expectation(description: "background commits completed")
+        finished.expectedFulfillmentCount = 20
+        for index in 0..<20 {
+            DispatchQueue.global(qos: .utility).async {
+                defer { finished.fulfill() }
+                do {
+                    _ = try GraphMigrationLedger.markStarted(
+                        migrationID: "concurrent", version: 1,
+                        configuration: configuration, operationID: "background-\(index)"
+                    )
+                } catch { XCTFail("Background commit failed: \(error)") }
+            }
+        }
+        _ = try GraphMigrationLedger.markStarted(
+            migrationID: "concurrent", version: 1,
+            configuration: configuration, operationID: "main"
+        )
+        wait(for: [finished], timeout: 10)
+        let history = try GraphMigrationLedger.history(
+            migrationID: "concurrent", version: 1, configuration: configuration
+        )
+        XCTAssertEqual(history.count, 21)
+        XCTAssertEqual(Set(history.map(\.operationID)).count, 21)
+        XCTAssertEqual(Set(history.map(\.generation)).count, 21)
+    }
+
     func testRetentionLimitAppliesToTheWholeStoreScope() throws {
         for index in 0..<90 {
             for migrationID in ["aggregate-a", "aggregate-b"] {

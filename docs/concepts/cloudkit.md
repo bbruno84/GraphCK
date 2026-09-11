@@ -28,6 +28,12 @@ keys are promoted only for Production and are ignored in Development.
 
 ## Configuration
 
+Developer tooling can inspect `try configuration.resolvingEnvironment()` before
+opening a store. The returned copy exposes its read-only `environment` and
+environment-aware URLs. Reject an unexpected environment before any mutation;
+do not infer CloudKit Development from the filename or APNs entitlement.
+This resolves configuration, not account availability or actual mirroring mode.
+
 ```swift
 var configuration = GraphStoreConfiguration()
 configuration.name = "Main"
@@ -65,8 +71,8 @@ private CloudKit database:
 graph.purgeCloudStore { result in
     switch result {
     case .success:
-        // The app must reopen or recreate the local store and
-        // clear local tokens and Persistent History.
+        // Reload cached domain objects; the same graph can save again.
+        // Keep SQLite files and their synchronization metadata.
         break
     case .failure(let error):
         print(error.localizedDescription)
@@ -76,8 +82,14 @@ graph.purgeCloudStore { result in
 
 The API operates only on an `NSPersistentCloudKitContainer` actually loaded
 with a CloudKit-configured store. It does not delete SQLite files, recreate the
-store, or purge during tests or on a local fallback. Local reset and token/
-history management remain the app's responsibility.
+store, or purge during tests or on a local fallback. Apple's operation deletes
+the corresponding managed objects as well as remote records. On success the
+view context is reset and the temporary write gate is released before completion.
+While purge runs, saves and transactions fail with `writesBlockedDuringPurge`.
+On failure the gate is also released. Callers must stop their own raw-context
+writers during purge and reload cached domain objects after success. No lock is
+held across the asynchronous operation, and no extra file deletion or history
+erasure is required by this wrapper.
 
 `NSPersistentCloudKitContainer` does not expose a distinct native event for
 the first sync. GraphEvo identifies the first import by combining the initial

@@ -137,7 +137,6 @@ private struct LedgerProjection: Codable {
 private struct LedgerSchemaHeader: Decodable { let schemaVersion: Int }
 
 private struct LedgerTransaction: Codable { let projection: LedgerProjection; let entry: GraphMigrationLedgerEntry? }
-private final class LedgerRetentionResult: @unchecked Sendable { var error: Error? }
 
 struct GraphMigrationLedgerSnapshot {
     let current: GraphMigrationRecord
@@ -169,7 +168,6 @@ enum GraphMigrationLedgerFaultPoint { case afterJournal, afterHistory, afterProj
 
 enum GraphMigrationLedger {
     private static let queue = DispatchQueue(label: "GraphEvo.migration-ledger")
-    private static let retentionQueue = DispatchQueue(label: "GraphEvo.migration-ledger.retention", qos: .utility)
     private static let fm = FileManager.default
     private static let schemaVersion = 1
     private static let maxBytes = 2 * 1024 * 1024
@@ -395,7 +393,9 @@ private extension GraphMigrationLedger {
         try faultForTesting?(.afterProjection)
 #endif
         try fm.removeItem(at: transaction)
-        try performRetention(in: recordURL(migrationID, version, configuration).deletingLastPathComponent())
+        // Commit already owns the serial ledger queue. Keep retention in this
+        // operation so errors propagate and no lower-QoS semaphore wait is needed.
+        try enforceStoreRetention(in: recordURL(migrationID, version, configuration).deletingLastPathComponent())
     }
 
     static func recoverTransactionIfNeeded(_ migrationID: String, _ version: Int, _ configuration: GraphStoreConfiguration) throws {
@@ -511,13 +511,6 @@ private extension GraphMigrationLedger {
     static func observedRemote(_ item: GraphMigrationLedgerEntry, source: String = "remoteKVS") -> GraphMigrationLedgerEntry { copy(item, source: source, observedAt: Date(), publishedAt: item.publishedAt ?? item.date) }
     static func copy(_ item: GraphMigrationLedgerEntry, source: String, observedAt: Date?, publishedAt: Date?) -> GraphMigrationLedgerEntry { GraphMigrationLedgerEntry(schemaVersion: item.schemaVersion, operationID: item.operationID, generation: item.generation, migrationID: item.migrationID, version: item.version, state: item.state, phase: item.phase, requestedBy: item.requestedBy, deviceID: item.deviceID, appVersion: item.appVersion, graphModelVersion: item.graphModelVersion, backupReference: item.backupReference, previousOperationID: item.previousOperationID, decisionReason: item.decisionReason, decisionSource: item.decisionSource, source: source, date: item.date, errorDescription: item.errorDescription, storeScope: item.storeScope, observedAt: observedAt, publishedAt: publishedAt, resetTargets: item.resetTargets, requestReason: item.requestReason) }
     static func record(from item: GraphMigrationLedgerEntry) -> GraphMigrationRecord { GraphMigrationRecord(migrationID: item.migrationID, version: item.version, state: item.state, startedAt: item.date, updatedAt: item.date, errorDescription: item.errorDescription) }
-
-    static func performRetention(in directory: URL) throws {
-        guard Thread.isMainThread else { try enforceStoreRetention(in: directory); return }
-        let semaphore = DispatchSemaphore(value: 0); let result = LedgerRetentionResult()
-        retentionQueue.async { do { try enforceStoreRetention(in: directory) } catch { result.error = error }; semaphore.signal() }
-        semaphore.wait(); if let error = result.error { throw error }
-    }
 
     static func enforceStoreRetention(in directory: URL) throws {
         guard fm.fileExists(atPath: directory.path) else { return }

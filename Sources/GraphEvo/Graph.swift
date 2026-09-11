@@ -45,6 +45,7 @@ public enum GraphStoreOpeningError: LocalizedError {
     case cloudKitEnvironmentUnavailable
     case cloudKitGraphAlreadyActive
     case incompatibleRegisteredStore(URL)
+    case applicationMigrationFailed(underlying: Error)
 
     public var errorDescription: String? {
         switch self {
@@ -60,6 +61,8 @@ public enum GraphStoreOpeningError: LocalizedError {
             return "A CloudKit Graph is already active in this process."
         case .incompatibleRegisteredStore(let url):
             return "The store at \(url.path) is already registered with an incompatible persistence configuration."
+        case .applicationMigrationFailed(let error):
+            return "Application migration failed: \(error.localizedDescription)"
         }
     }
 }
@@ -198,9 +201,8 @@ public class Graph: NSObject {
     /// be created for both CloudKit and local stores.
     internal var persistentContainer: NSPersistentContainer?
 
-    /// Serializes saves with administrative CloudKit operations such as purge.
-    /// The lock is intentionally internal: the public API remains the only
-    /// supported entry point for purging a store.
+    /// Serializes ordinary saves. Purge uses a view-queue state gate instead:
+    /// a thread-owned lock must not span asynchronous CloudKit completion.
     internal let persistenceOperationLock = NSRecursiveLock()
 
     private let cloudPurgeStateLock = NSLock()
@@ -238,6 +240,7 @@ public class Graph: NSObject {
     internal var completion: ((Bool, Error?) -> Void)?
 
     internal let migrationEnabled: Bool
+    internal var isTransactionFacade = false
     internal var readinessCompletions: [(Result<Graph, GraphStoreOpeningError>) -> Void] = []
     
     /// Deinitializer that removes the Graph from NSNotificationCenter.
@@ -270,15 +273,41 @@ public class Graph: NSObject {
             failStoreOpening(error)
             return
         }
+        if migrationEnabled && resolvedConfiguration.waitsForApplicationMigrations {
+            GraphMigrationManager.handlePhaseResult(.preInit, configuration: resolvedConfiguration, graph: nil) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    switch result {
+                    case .success: self.openAfterPreInit()
+                    case .failure(let error): self.failStoreOpening(.applicationMigrationFailed(underlying: error))
+                    }
+                }
+            }
+            return
+        }
         if migrationEnabled {
             GraphMigrationManager.handlePhase(.preInit, configuration: resolvedConfiguration, graph: nil)
         }
+        openAfterPreInit()
+    }
+
+    private func openAfterPreInit() {
         observeRemoteStoreChanges()
         checkICloudAccountStatus()
         prepareGraphContextRegistry()
         GraphContextRegistry.shared.withStoreOpenLock {
-            prepareManagedObjectContext(configuration: resolvedConfiguration)
+            prepareManagedObjectContext(configuration: configuration)
         }
+    }
+
+    /// A scoped facade for public Node APIs; never opens/registers another store.
+    internal init(transactionContext: NSManagedObjectContext, configuration: GraphStoreConfiguration) {
+        self.configuration = configuration
+        self.migrationEnabled = false
+        super.init()
+        self.managedObjectContext = transactionContext
+        self.isTransactionFacade = true
+        self.readiness = .ready
     }
 
     /// Initializes a Graph and reports when its store and lifecycle are ready.

@@ -66,6 +66,10 @@ extension Graph {
    executed when the save operation is completed.
    */
   public func async(_ completion: ((Bool, Error?) -> Void)? = nil) {
+    guard !isTransactionFacade else {
+      GraphCompletionCallback(success: false, error: GraphTransactionError.nestedTransaction, completion: completion)
+      return
+    }
     guard let moc = managedObjectContext else {
       GraphCompletionCallback(
         success: false,
@@ -77,6 +81,10 @@ extension Graph {
     moc.perform { [weak moc] in
       self.persistenceOperationLock.lock()
       defer { self.persistenceOperationLock.unlock() }
+      guard !self.isCloudPurgeInProgress else {
+        GraphCompletionCallback(success: false, error: GraphCloudPurgeError.writesBlockedDuringPurge, completion: completion)
+        return
+      }
       do {
         try moc?.save()
         GraphCompletionCallback(success: true, error: nil, completion: completion)
@@ -92,6 +100,10 @@ extension Graph {
    executed when the save operation is completed.
    */
   public func sync(_ completion: ((Bool, Error?) -> Void)? = nil) {
+    guard !isTransactionFacade else {
+      GraphCompletionCallback(success: false, error: GraphTransactionError.nestedTransaction, completion: completion)
+      return
+    }
     guard let moc = managedObjectContext else {
       GraphCompletionCallback(
         success: false,
@@ -105,6 +117,10 @@ extension Graph {
 
     persistenceOperationLock.lock()
     moc.performAndWait { [unowned moc] in
+      guard !self.isCloudPurgeInProgress else {
+        saveError = GraphCloudPurgeError.writesBlockedDuringPurge
+        return
+      }
       do {
         try moc.save()
         success = true

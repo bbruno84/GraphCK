@@ -116,6 +116,7 @@ public enum GraphWarning: LocalizedError {
 /// `GraphReadiness`: the store may still be open and usable even when an
 /// application-defined migration did not complete.
 public enum GraphFailure: LocalizedError {
+    case transaction(underlying: GraphTransactionError, diagnostics: GraphTransactionDiagnostics)
     case storeOpening(GraphStoreOpeningError)
     case migration(migrationID: String, phase: String, underlying: Error)
     case persistentHistory(underlying: Error)
@@ -124,6 +125,8 @@ public enum GraphFailure: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
+        case .transaction(let error, let diagnostics):
+            return "\(error.localizedDescription) \(diagnostics.summary)"
         case .storeOpening(let error):
             return error.localizedDescription
         case .migration(let migrationID, let phase, let error):

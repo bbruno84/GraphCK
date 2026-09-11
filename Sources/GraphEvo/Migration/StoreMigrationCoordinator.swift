@@ -16,7 +16,7 @@ final class StoreMigrationCoordinator {
         let phase: GraphMigrationManager.GraphLifecyclePhase
         let configuration: GraphStoreConfiguration?
         let graph: Graph?
-        let completion: (() -> Void)?
+        let completion: ((Result<Void, Error>) -> Void)?
     }
 
     private final class CompletionGate {
@@ -34,11 +34,11 @@ final class StoreMigrationCoordinator {
     private var context = GraphMigrationContext()
     private var pending: [PendingPhase] = []
     private var generation: UInt64 = 0
-    private var completion: (() -> Void)?
+    private var completion: ((Result<Void, Error>) -> Void)?
 
     init(scope: GraphStoreScope) { self.scope = scope }
 
-    func handle(_ phase: GraphMigrationManager.GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?, completion: (() -> Void)?) {
+    func handle(_ phase: GraphMigrationManager.GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?, completion: ((Result<Void, Error>) -> Void)?) {
         lock.lock(); defer { lock.unlock() }
         if phaseInFlight { pending.append(PendingPhase(phase: phase, configuration: configuration, graph: graph, completion: completion)); return }
         phaseInFlight = true; self.completion = completion
@@ -200,17 +200,17 @@ final class StoreMigrationCoordinator {
         }
         GraphMigrationManager.postFailureNotification(migrationID: migration.id, phase: phase, configuration: configuration, graph: graph, error: reportedError)
         graph?.emit(.error(.migration(migrationID: migration.id, phase: String(describing: phase), underlying: reportedError)))
-        active.remove(migration.id); attemptMetadata.removeValue(forKey: migration.id); finish()
+        active.remove(migration.id); attemptMetadata.removeValue(forKey: migration.id); finish(.failure(reportedError))
     }
 
     private func advance(_ phase: GraphMigrationManager.GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?) { index += 1; run(phase, configuration: configuration, graph: graph) }
 
-    private func finish() {
+    private func finish(_ result: Result<Void, Error> = .success(())) {
         guard phaseInFlight else { return }
         phaseInFlight = false; generation &+= 1
         let completed = completion; completion = nil
         if let next = pending.first { pending.removeFirst(); phaseInFlight = true; completion = next.completion; start(next.phase, configuration: next.configuration, graph: next.graph) }
         else if active.isEmpty { GraphMigrationManager.discardCoordinator(self) }
-        completed?()
+        completed?(result)
     }
 }

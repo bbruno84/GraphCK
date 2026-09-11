@@ -49,8 +49,14 @@ GraphEvo internally identifies whether the resolved store is for CloudKit
 Development, CloudKit Production, or local persistence. Directory-based
 CloudKit stores select the environment automatically; Development stores use a
 `-dev` filename suffix. `Graph(storeURL:)` always uses local persistence. The
-environment and its scope are implementation details and are not part of the
-application-facing API.
+environment is exposed as read-only `environment: GraphStoreEnvironment?`
+(`development`, `production`, `local`). Before opening, call
+`try configuration.resolvingEnvironment()` to obtain a normalized copy using
+the same container precedence and signed-environment resolver as Graph and
+the migration ledger. It does not open or mutate a store; unavailable CloudKit
+environment information throws. Use the returned copy for URL/scope decisions.
+Applications cannot set the environment. XCTest retains its existing simulated
+Development resolution and does not establish actual CloudKit availability.
 
 For `.inMemory`, URLs are still calculated for consistency but do not identify a
 persistent file. `appGroupIdentifier` affects directory-based configurations;
@@ -103,6 +109,81 @@ environment, registry-conflict, and incompatible-registered-store cases. An
 incompatible store is not changed automatically.
 
 ## 4. Nodes and domain objects
+
+`Node.setCreatedDate(_:)` preserves an imported creation timestamp on an existing
+node without changing its persistent ID. Save through `sync` or an enclosing
+`Graph.transaction`.
+
+### Required application migrations and scoped transactions
+
+`GraphStoreConfiguration.waitsForApplicationMigrations` defaults to `false`.
+When enabled, no persistent context is opened until asynchronous `.preInit`
+work finishes successfully. All subsequent migration phases must also succeed
+before readiness becomes `.ready`. A migration or ledger failure reports
+`GraphStoreOpeningError.applicationMigrationFailed(underlying:)`.
+
+`GraphMigrationManager.handlePhaseResult(_:configuration:graph:completion:)`
+returns `Result<Void, Error>`. The existing completion-only overload preserves
+its diagnostic-only failure contract.
+
+`Graph.transaction<T>(_ body: (Graph) throws -> T) throws -> T` supplies an
+isolated, pinned private-context facade and saves once after the body succeeds.
+Only return value snapshots; do not retain its Graph/Nodes or call `sync` inside
+the body. Errors roll back the private context. Existing object IDs and store
+metadata remain unchanged. Pending view-context edits cause a retryable error.
+This check runs both before computation and immediately before commit. The view
+queue is held only for the final check/save/merge, protecting edits made while
+the private body was running without holding the UI queue during computation.
+SQLite generation changes detected before save and optimistic locking conflicts
+fail the transaction. This does not stop external CloudKit imports: concurrent
+insertions after the last generation check must be handled by a subsequent
+idempotent reconciliation pass. No filesystem replacement is performed.
+
+Before a commit containing deletions, registered view objects updated or deleted
+by that transaction are refaulted while the view is verified clean. This prevents
+stale materialized property relationships from leaving already-saved deletions
+pending in the view context. The commit is merged using object IDs, not private
+context objects. Read-only transactions do not refresh objects; unrelated view
+objects and genuine unsaved edits are preserved.
+
+Retained whole-node deletions can still remain pending after Core Data's merge.
+The transaction finalizes the view context only when its entire pending set is
+made of deletions whose IDs were reported deleted by this successful private
+save, with no changed fields, inserts, updates or unrelated deletions. This is
+not a general-purpose automatic save or rollback of user changes. SQLite tests
+verify that this finalization creates no additional persistent-history
+transaction and that the deferred automatic merge leaves the view clean.
+Automatic merging stays enabled; CloudKit imports are not suspended. A failure
+during finalization is propagated even though the private commit has succeeded;
+callers must retain their idempotent retry semantics.
+
+Pending view changes also emit `GraphFailure.transaction(underlying:diagnostics:)`
+through `GraphEventDelegate`, while still throwing the original
+`GraphTransactionError.pendingUserChanges` (NSError code 1). The error now has a
+readable `LocalizedError` description. `GraphTransactionDiagnostics` distinguishes
+`beforeBody` from `beforeCommit` and reports actual container kind, object counts,
+and up to 20 groups of Core Data entity/schema keys and current-event keys.
+Its `summary` contains no property values, dynamic domain names/keys, object IDs,
+paths or account identifiers. Diagnostics neither save nor discard pending changes.
+The host application owns logging; GraphEvo does not write these events to a log.
+
+In DEBUG builds, rejected transactions also populate `debugDetails` with dynamic
+property names, changed fields' committed/current values, object URI IDs and
+materialized owner type/properties, and whole nodes' type/properties (including
+deleted nodes when still materialized). These details can contain sensitive data;
+applications must explicitly choose whether to log them. Release builds always
+return an empty detail list. The DEBUG-only
+`graph.pendingChangeDiagnostics(checkpoint:)` captures the same details without
+attempting a transaction or emitting a failure. It can also report a clean
+context at an application lifecycle checkpoint.
+
+Details are bounded to 100 changed objects, 40 materialized owner properties,
+and 2,048 characters per textual value. Binary data reports byte count and its
+first 64 bytes in base64. Faults are identified without forcing their values;
+no permanent IDs are allocated. Committed values are the context's committed
+snapshot, not an independent disk read. No stack trace or write-origin tracking
+is implied by this diagnostic.
+
 
 `Node` is the common base for all public graph objects. It exposes `graph`,
 `type`, `id`, `createdDate`, dynamic property access through
@@ -299,7 +380,14 @@ graph remains local. If CloudKit is unavailable, GraphEvo may emit
 `GraphWarning.cloudStoreFallback` and use a local fallback.
 
 `purgeCloudStore(completion:)` is restricted to a loaded CloudKit container and
-does not delete or recreate local SQLite files. Import and export lifecycle
+uses Apple's purge of records and corresponding managed objects. It does not
+delete or recreate local SQLite files. During purge, saves and transactions
+fail with `GraphCloudPurgeError.writesBlockedDuringPurge`. After successful Apple
+completion, the view context is reset and writes are enabled before the app's
+callback. Clients reload cached nodes in that callback, without reopening the
+Graph. Clients must stop their own raw-context writers during purge.
+Errors also release the gate. No thread-owned lock is held
+across Apple's asynchronous callback. Import and export lifecycle
 updates are delivered through `GraphEventDelegate`.
 
 ## 8. Persistent History
