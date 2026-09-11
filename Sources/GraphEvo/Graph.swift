@@ -255,7 +255,12 @@ public class Graph: NSObject {
     }
     
     /// New initializer using GraphStoreConfiguration.
-    public init(configuration: GraphStoreConfiguration, migrationEnabled: Bool = true) {
+    public init(configuration: GraphStoreConfiguration, migrationEnabled: Bool = true,
+                preflight: (() throws -> Void)? = nil) {
+        // Application policy rejection must precede ledger inspection, even
+        // when migrations were already completed or deliberately suppressed.
+        var preflightFailure: Error?
+        do { try preflight?() } catch { preflightFailure = error }
         var resolvedConfiguration = configuration
         resolvedConfiguration.cloudKitContainerIdentifier = Self.resolvedCloudKitContainerIdentifier(
             configuration: configuration,
@@ -269,6 +274,10 @@ public class Graph: NSObject {
         self.migrationEnabled = migrationEnabled
         GraphValueTransformer.register()
         super.init()
+        if let preflightFailure {
+            failStoreOpening(.applicationMigrationFailed(underlying: preflightFailure))
+            return
+        }
         if case .failure(let error) = environmentResult {
             failStoreOpening(error)
             return

@@ -4,6 +4,21 @@ import SQLite3
 @testable import GraphEvo
 
 final class GraphLocalStoreResetTests: XCTestCase {
+    func testApplicationPreflightFailureNeverOpensStoreWithoutMigrations() throws {
+        let config = configuration()
+        let graph = Graph(configuration: config, migrationEnabled: false, preflight: {
+            throw CocoaError(.validationMissingMandatoryProperty)
+        })
+        let failed = expectation(description: "preflight failed")
+        graph.whenReady { result in
+            if case .success = result { XCTFail("Rejected configuration opened") }
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 5)
+        XCTAssertNil(graph.managedObjectContext)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: config.resolvedStoreURL.path))
+    }
+
     private func configuration() -> GraphStoreConfiguration {
         var config = GraphStoreConfiguration()
         config.location = FileManager.default.temporaryDirectory

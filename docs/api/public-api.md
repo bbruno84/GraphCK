@@ -66,7 +66,8 @@ it does not move an explicit SQLite file.
 
 ```swift
 public init(configuration: GraphStoreConfiguration,
-            migrationEnabled: Bool = true)
+            migrationEnabled: Bool = true,
+            preflight: (() throws -> Void)? = nil)
 public init(storeURL: URL,
             backend: GraphStoreBackend = .sqlite,
             migrationEnabled: Bool = true)
@@ -77,6 +78,11 @@ does not inherit a CloudKit container identifier from `Graph`, configuration,
 or `Info.plist`.
 
 `Graph` opens a store and owns the Core Data context used by the public facades.
+An optional synchronous `preflight` validates application opening policy before
+any ledger or store activity. Its failure reports failed readiness using
+`applicationMigrationFailed`, including when migrations are disabled or their
+ledger is already complete. The default preserves existing behavior. Keep this
+callback read-only; do not open another Graph or do asynchronous work inside it.
 Use `whenReady` when opening must be coordinated explicitly:
 
 ```swift
