@@ -87,6 +87,86 @@ final class GraphWatchReportTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .addedActionToGroup(_, "activity") = $0 { return true }; return false })
     }
 
+    func testLocalReportIncludesRelationshipWhenNewEntityLinksToExistingEntity() {
+        let graph = makeGraph()
+        let existing = Entity("Existing", graph: graph)
+        graph.sync()
+
+        let collector = ReportCollector()
+        let received = expectation(description: "local relationship report")
+        collector.onReport = { report in
+            guard report.events.contains(where: {
+                if case .insertedRelationship = $0 { return true }
+                return false
+            }) else { return }
+            received.fulfill()
+        }
+        install(collector, on: graph)
+
+        let inserted = Entity("Inserted", graph: graph)
+        _ = inserted.is(relationship: "relatesTo").of(existing)
+        graph.sync()
+        wait(for: [received], timeout: 2)
+
+        let events = try! XCTUnwrap(collector.reports.last?.events)
+        XCTAssertTrue(events.contains { if case .insertedEntity = $0 { return true }; return false })
+        XCTAssertTrue(events.contains { if case .insertedRelationship = $0 { return true }; return false })
+    }
+
+    func testLocalReportsAreDeliveredForTwoSeparateSyncs() {
+        let graph = makeGraph()
+        let existing = Entity("Existing", graph: graph)
+        graph.sync()
+
+        let collector = ReportCollector()
+        let firstReport = expectation(description: "first local report")
+        let secondReport = expectation(description: "second local report")
+        collector.onReport = { report in
+            if report.events.contains(where: { if case .insertedEntity = $0 { return true }; return false }) {
+                firstReport.fulfill()
+            }
+            if report.events.contains(where: { if case .insertedRelationship = $0 { return true }; return false }) {
+                secondReport.fulfill()
+            }
+        }
+        install(collector, on: graph)
+
+        let inserted = Entity("Inserted", graph: graph)
+        graph.sync()
+        _ = inserted.is(relationship: "relatesTo").of(existing)
+        graph.sync()
+
+        wait(for: [firstReport, secondReport], timeout: 2)
+        XCTAssertGreaterThanOrEqual(collector.reports.count, 2)
+    }
+
+    func testLocalReportsIncludeExplicitRelationshipCreatedAfterEntitySync() {
+        let graph = makeGraph()
+        let existing = Entity("Existing", graph: graph)
+        let collector = ReportCollector()
+        let firstReport = expectation(description: "entity report")
+        let secondReport = expectation(description: "relationship report")
+        collector.onReport = { report in
+            if report.events.contains(where: { if case .insertedEntity = $0 { return true }; return false }) {
+                firstReport.fulfill()
+            }
+            if report.events.contains(where: { if case .insertedRelationship = $0 { return true }; return false }) {
+                secondReport.fulfill()
+            }
+        }
+        install(collector, on: graph)
+
+        let inserted = Entity("Inserted", graph: graph)
+        graph.sync()
+        let relationship = Relationship("relatesTo", graph: graph)
+        relationship.subject = inserted
+        relationship.object = existing
+        graph.sync()
+
+        wait(for: [firstReport, secondReport], timeout: 2)
+        XCTAssertGreaterThanOrEqual(collector.reports.count, 2)
+    }
+
     func testLocalDeletionKeepsGraphObjectAndIsDeliveredWithTheSaveBatch() {
         let graph = makeGraph()
         let entity = Entity("Temporary", graph: graph)
