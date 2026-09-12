@@ -72,8 +72,9 @@ final class GraphReadinessTests: XCTestCase {
 
         let expectation = expectation(description: "Graph becomes ready")
         var graph: Graph?
+        var openingGraph: Graph?
 
-        Graph(
+        openingGraph = Graph(
             configuration: configuration,
             migrationEnabled: false,
             onReady: { result in
@@ -91,6 +92,30 @@ final class GraphReadinessTests: XCTestCase {
 
         wait(for: [expectation], timeout: 2)
         XCTAssertTrue(graph?.isReady == true)
+        withExtendedLifetime(openingGraph) {}
+    }
+
+    func testEnvironmentIsResolvedBeforeReadiness() {
+        var configuration = GraphStoreConfiguration()
+        configuration.name = "Environment-\(UUID().uuidString)"
+        configuration.backend = .inMemory
+
+        let graph = Graph(configuration: configuration, migrationEnabled: false)
+        let collector = EventCollector()
+        graph.eventDelegate = collector
+
+        let readinessEvents = collector.events.compactMap { event -> GraphReadiness? in
+            guard case .stateChanged(let state) = event else { return nil }
+            switch state {
+            case .readiness(let readiness):
+                if case .ready = readiness { return readiness }
+                return nil
+            default: return nil
+            }
+        }
+
+        XCTAssertEqual(readinessEvents.count, 1)
+        XCTAssertEqual(graph.configuration.environment, .local)
     }
 
     func testAsyncInitializerReportsExistingStoreFailureWithoutReplacingIt() throws {
@@ -203,6 +228,29 @@ final class GraphReadinessTests: XCTestCase {
             if case .stateChanged(.readiness(.failed)) = event { return true }
             return false
         })
+    }
+
+    func testAutomaticLifecycleIncludesPostMigrationBeforeReady() {
+        GraphMigrationManager.resetForTesting()
+        defer { GraphMigrationManager.resetForTesting() }
+        var phases: [GraphMigrationManager.GraphLifecyclePhase] = []
+        for phase in [GraphMigrationManager.GraphLifecyclePhase.preInit, .postInit, .postMigration, .ready] {
+            GraphMigrationManager.registerCallback(for: phase) { _, _ in phases.append(phase) }
+        }
+        var configuration = GraphStoreConfiguration()
+        configuration.name = "LifecycleOrder-\(UUID().uuidString)"
+        configuration.backend = .inMemory
+        let graph = Graph(configuration: configuration)
+        let ready = expectation(description: "ready")
+        graph.whenReady { _ in ready.fulfill() }
+        wait(for: [ready], timeout: 2)
+        XCTAssertEqual(phases.count, 4)
+        if phases.count == 4 {
+            if case .preInit = phases[0] {} else { XCTFail("Expected preInit first") }
+            if case .postInit = phases[1] {} else { XCTFail("Expected postInit second") }
+            if case .postMigration = phases[2] {} else { XCTFail("Expected postMigration third") }
+            if case .ready = phases[3] {} else { XCTFail("Expected ready last") }
+        }
     }
 
     func testEventDelegateReceivesPersistenceAndReadinessStates() {

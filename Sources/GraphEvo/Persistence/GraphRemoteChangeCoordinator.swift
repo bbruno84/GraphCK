@@ -35,6 +35,11 @@ internal final class RemoteChangeCoordinator {
             guard let self else { return }
             self.queue.async {
                 self.processing = false
+                // Batch delivery has its own cursor. Re-evaluate it after
+                // every Persistent History cycle, including cycles that did
+                // not advance the processing token, so a previously failed
+                // materialization can be retried on the next CloudKit wakeup.
+                graph.watchEventCoordinator?.requestCloudDelivery()
                 if processed {
                     self.pending = true
                 }

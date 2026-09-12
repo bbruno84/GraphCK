@@ -125,6 +125,10 @@ A watcher is initially stopped. Configure its filter and delegate, then call
 `resume()`. Use `pause()` to suspend it and `clear()` to remove the filter.
 Callbacks distinguish `GraphSource.local` and `GraphSource.cloud`.
 
+For Graph-level batches, assign `Graph.watchReportCompletion` and select sources
+with `Graph.watchReportSources`. Batch reports do not apply Watch predicates,
+are delivered on the main thread, and do not disable legacy callbacks.
+
 ## CloudKit and Persistent History
 
 Container identifier precedence is:
@@ -141,6 +145,11 @@ Persistent History uses a persisted token and filters local-authored
 transactions to avoid duplicate callbacks on the originating device.
 
 ## Migrations
+
+`waitsForApplicationMigrations` is an opt-in bootstrap/readiness gate. Preserve
+its default `false` behavior when modifying lifecycle code. `graph.transaction`
+offers public Node APIs on a scoped private context; do not escape the facade,
+perform external writes inside its body, or mistake it for a CloudKit pause.
 
 Register migrations before creating or opening a graph:
 

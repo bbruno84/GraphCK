@@ -35,7 +35,7 @@ The companion demonstration app is maintained separately in the
 - `NSPersistentCloudKitContainer` support with local fallback
 - SQLite stores compatible with existing `GraphEvo_<name>.sqlite` paths
 - Directory-based configuration with a backend-independent canonical path; legacy `Local/...` and `Cloud/...` paths are reused automatically
-- `Graph(storeURL:)` accepts either a directory or an existing SQLite file and preserves an explicit file path
+- `Graph(storeURL:)` accepts either a directory or an existing SQLite file, preserves an explicit file path, and always opens it as local persistence
 - No automatic migration between incompatible models: the app must migrate its store and reopen it at the original path
 - Secure encoding of heterogeneous values through `ValueTransformer`
 - Enabled options: `NSPersistentHistoryTrackingKey`, `NSPersistentStoreRemoteChangeNotificationPostOptionKey`

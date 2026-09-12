@@ -9,6 +9,7 @@ public enum GraphCloudPurgeError: LocalizedError, Equatable {
     case cloudStoreUnavailable
     case purgeAlreadyInProgress
     case invalidCompletion
+    case writesBlockedDuringPurge
 
     public var errorDescription: String? {
         switch self {
@@ -24,6 +25,8 @@ public enum GraphCloudPurgeError: LocalizedError, Equatable {
             return "A CloudKit purge is already in progress for this graph."
         case .invalidCompletion:
             return "CloudKit reported an incomplete purge result."
+        case .writesBlockedDuringPurge:
+            return "CloudKit purge is in progress. Retry saving after completion."
         }
     }
 }
@@ -34,9 +37,10 @@ extension Graph {
     ///
     /// The completion is delivered on the main queue after Core Data invokes
     /// its purge completion. A nil error is considered success only when the
-    /// expected zone ID is also returned. After a successful purge, the
-    /// caller must reopen or recreate its local store and clear any local
-    /// persistent-history token before using the graph again.
+    /// expected zone ID is also returned. Apple removes the corresponding
+    /// local managed objects as well. The SQLite files are retained. After
+    /// success the view context is reset and writes are enabled before the
+    /// callback. The caller must reload cached application objects there.
     public func purgeCloudStore(
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
@@ -67,24 +71,29 @@ extension Graph {
             return
         }
 
-        guard beginCloudPurge() else {
-            deliverPurgeResult(.failure(GraphCloudPurgeError.purgeAlreadyInProgress), completion: completion)
-            return
-        }
+        executeCloudPurge(container: container, store: store, executor: { container, zone, store, callback in
+            container.purgeObjectsAndRecordsInZone(with: zone, in: store, completion: callback)
+        }, completion: completion)
+    }
 
-        // Flush the graph context before starting the remote administrative
-        // operation. The operation lock also makes Graph.sync/async wait until
-        // the purge's Core Data/CloudKit completion has arrived.
-        persistenceOperationLock.lock()
+    private func executeCloudPurge(
+        container: NSPersistentCloudKitContainer,
+        store: NSPersistentStore,
+        executor: @escaping (NSPersistentCloudKitContainer, CKRecordZone.ID, NSPersistentStore, @escaping (CKRecordZone.ID?, Error?) -> Void) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         guard let context = managedObjectContext else {
-            persistenceOperationLock.unlock()
-            endCloudPurge()
             deliverPurgeResult(.failure(GraphCloudPurgeError.cloudContainerUnavailable), completion: completion)
             return
         }
 
-        context.perform { [weak self, weak context] in
-            guard let self, let context else { return }
+        // Serialize the gate with transaction commits on the view queue.
+        // Never hold a thread-owned lock across an asynchronous callback.
+        context.perform {
+            guard self.beginCloudPurge() else {
+                self.deliverPurgeResult(.failure(GraphCloudPurgeError.purgeAlreadyInProgress), completion: completion)
+                return
+            }
             do {
                 if context.hasChanges {
                     try context.save()
@@ -93,12 +102,7 @@ extension Graph {
                     zoneName: "com.apple.coredata.cloudkit.zone",
                     ownerName: CKCurrentUserDefaultName
                 )
-                self.invokeCloudPurge(
-                    container: container,
-                    zoneID: zoneID,
-                    store: store
-                ) { [weak self] purgedZoneID, error in
-                    guard let self else { return }
+                executor(container, zoneID, store) { purgedZoneID, error in
                     let result: Result<Void, Error>
                     if let error {
                         result = .failure(error)
@@ -107,13 +111,17 @@ extension Graph {
                     } else {
                         result = .success(())
                     }
-                    self.endCloudPurge()
-                    self.persistenceOperationLock.unlock()
-                    self.deliverPurgeResult(result, completion: completion)
+                    context.perform {
+                        if case .success = result {
+                            // Discard stale registered objects after Apple's purge.
+                            context.reset()
+                        }
+                        self.endCloudPurge()
+                        self.deliverPurgeResult(result, completion: completion)
+                    }
                 }
             } catch {
                 self.endCloudPurge()
-                self.persistenceOperationLock.unlock()
                 self.deliverPurgeResult(.failure(error), completion: completion)
             }
         }
@@ -133,15 +141,6 @@ extension Graph {
                 description.url?.standardizedFileURL == storeURL.standardizedFileURL
             }
         }
-    }
-
-    private func invokeCloudPurge(
-        container: NSPersistentCloudKitContainer,
-        zoneID: CKRecordZone.ID,
-        store: NSPersistentStore,
-        completion: @escaping (CKRecordZone.ID?, Error?) -> Void
-    ) {
-        container.purgeObjectsAndRecordsInZone(with: zoneID, in: store, completion: completion)
     }
 
     private func deliverPurgeResult(
@@ -180,22 +179,7 @@ extension Graph {
             deliverPurgeResult(.failure(GraphCloudPurgeError.cloudKitNotConfigured), completion: completion)
             return
         }
-        guard beginCloudPurge() else {
-            deliverPurgeResult(.failure(GraphCloudPurgeError.purgeAlreadyInProgress), completion: completion)
-            return
-        }
-        let zoneID = CKRecordZone.ID(zoneName: "com.apple.coredata.cloudkit.zone", ownerName: CKCurrentUserDefaultName)
-        executor(container, zoneID, store) { [weak self] purgedZoneID, error in
-            guard let self else { return }
-            defer { self.endCloudPurge() }
-            if let error {
-                self.deliverPurgeResult(.failure(error), completion: completion)
-            } else if purgedZoneID == zoneID {
-                self.deliverPurgeResult(.success(()), completion: completion)
-            } else {
-                self.deliverPurgeResult(.failure(GraphCloudPurgeError.invalidCompletion), completion: completion)
-            }
-        }
+        executeCloudPurge(container: container, store: store, executor: executor, completion: completion)
     }
 }
 #endif

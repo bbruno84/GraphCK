@@ -330,6 +330,10 @@ public protocol Watchable {
   associatedtype Element: Node
 }
 
+internal protocol AnyGraphWatcher: AnyObject {
+  func receive(_ envelopes: [GraphWatchEventEnvelope], source: GraphSource)
+}
+
 public struct Watcher {
   /// A weak reference to the stored object.
   private weak var object: AnyObject?
@@ -338,6 +342,9 @@ public struct Watcher {
   public var watch: Watch<Node>? {
     return object as? Watch<Node>
   }
+
+  internal var receiver: AnyGraphWatcher? { object as? AnyGraphWatcher }
+  internal var isAlive: Bool { object != nil }
   
   /**
    An initializer that takes in an object instance.
@@ -349,7 +356,7 @@ public struct Watcher {
 }
 
 /// Watch.
-public class Watch<T: Node>: Watchable {
+public class Watch<T: Node>: Watchable, AnyGraphWatcher {
   public typealias Element = T
   
   /// A Graph instance.
@@ -549,7 +556,7 @@ public class Watch<T: Node>: Watchable {
       delegateToDeletedWatchers(filtered(objects), source: .cloud)
     }}
 
-fileprivate extension Watch {
+extension Watch {
   /**
    Passes the handle to the inserted notification delegates.
    - Parameter _ set: A Set of AnyHashable objects to pass.
@@ -961,7 +968,7 @@ fileprivate extension Watch {
   }
   
   /// Prepares the Watch instance.
-  func prepare() {
+    func prepare() {
     prepareGraph()
     resume()
   }
@@ -976,9 +983,9 @@ fileprivate extension Watch {
       defaultCenter.addObserver(self, selector: #selector(notifyInsertedWatchers), name: .NSManagedObjectContextDidSave, object: moc)
       defaultCenter.addObserver(self, selector: #selector(notifyUpdatedWatchers), name: .NSManagedObjectContextDidSave, object: moc)
       defaultCenter.addObserver(self, selector: #selector(notifyDeletedWatchers), name: .NSManagedObjectContextObjectsDidChange, object: moc)
-      defaultCenter.addObserver(self,selector: #selector(notifyInsertedWatchersFromCloud(_:)),name: .GraphEvoSimulatedRemoteChange, object: nil)
-      defaultCenter.addObserver(self,selector: #selector(notifyUpdatedWatchersFromCloud(_:)),name: .GraphEvoSimulatedRemoteChange,object: nil)
-      defaultCenter.addObserver(self,selector: #selector(notifyDeletedWatchersFromCloud(_:)),name: .GraphEvoSimulatedRemoteChange,object: nil)
+      defaultCenter.addObserver(self, selector: #selector(notifyInsertedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
+      defaultCenter.addObserver(self, selector: #selector(notifyUpdatedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
+      defaultCenter.addObserver(self, selector: #selector(notifyDeletedWatchersFromCloud(_:)), name: .GraphEvoSimulatedRemoteChange, object: nil)
     }
   
   /// Prepares graph for watching.
@@ -1056,5 +1063,98 @@ fileprivate extension Watch {
       
       return passesPredicate(v)
     })
+  }
+
+  internal func receive(_ envelopes: [GraphWatchEventEnvelope], source: GraphSource) {
+    guard isRunning else { return }
+    envelopes.forEach { envelope in
+      guard matchesPredicate(envelope.owner) else { return }
+      envelope.event.deliver(to: delegate, graph: graph, source: source)
+    }
+  }
+
+  private func matchesPredicate(_ node: ManagedNode) -> Bool {
+    guard node.nodeClass == NodeClass(nodeType: T.self)?.rawValue else { return false }
+    guard let predicate else { return true }
+
+    var tagSet = node.tagSet
+    var groupSet = node.groupSet
+    var propertySet = node.propertySet
+    let oldNodeValues = node.changedValuesForCurrentEvent()
+    if let old = oldNodeValues["tagSet"] as? Set<ManagedTag> { tagSet.formUnion(old) }
+    if let old = oldNodeValues["groupSet"] as? Set<ManagedGroup> { groupSet.formUnion(old) }
+    if let old = oldNodeValues["propertySet"] as? Set<ManagedProperty> { propertySet.formUnion(old) }
+
+    return predicate.predicate.evaluate(with: [
+      "type": node.type,
+      "tagSet": tagSet,
+      "groupSet": groupSet,
+      "propertySet": propertySet,
+    ])
+  }
+}
+
+private extension GraphWatchEvent {
+  func deliver(to delegate: GraphNodeDelegate?, graph: Graph, source: GraphSource) {
+    switch self {
+    case .insertedEntity(let entity):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, inserted: entity, source: source)
+    case .deletedEntity(let entity):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, deleted: entity, source: source)
+    case .addedEntityProperty(let entity, let name, let value):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, added: name, with: value, source: source)
+    case .updatedEntityProperty(let entity, let name, let value):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, updated: name, with: value, source: source)
+    case .removedEntityProperty(let entity, let name, let value):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, removed: name, with: value, source: source)
+    case .addedEntityTag(let entity, let name):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, added: name, source: source)
+    case .removedEntityTag(let entity, let name):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, removed: name, source: source)
+    case .addedEntityToGroup(let entity, let name):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, addedTo: name, source: source)
+    case .removedEntityFromGroup(let entity, let name):
+      (delegate as? GraphEntityDelegate)?.graph?(graph, entity: entity, removedFrom: name, source: source)
+
+    case .insertedRelationship(let relationship):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, inserted: relationship, source: source)
+    case .updatedRelationship(let relationship):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, updated: relationship, source: source)
+    case .deletedRelationship(let relationship):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, deleted: relationship, source: source)
+    case .addedRelationshipProperty(let relationship, let name, let value):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, added: name, with: value, source: source)
+    case .updatedRelationshipProperty(let relationship, let name, let value):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, updated: name, with: value, source: source)
+    case .removedRelationshipProperty(let relationship, let name, let value):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, removed: name, with: value, source: source)
+    case .addedRelationshipTag(let relationship, let name):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, added: name, source: source)
+    case .removedRelationshipTag(let relationship, let name):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, removed: name, source: source)
+    case .addedRelationshipToGroup(let relationship, let name):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, addedTo: name, source: source)
+    case .removedRelationshipFromGroup(let relationship, let name):
+      (delegate as? GraphRelationshipDelegate)?.graph?(graph, relationship: relationship, removedFrom: name, source: source)
+
+    case .insertedAction(let action):
+      (delegate as? GraphActionDelegate)?.graph?(graph, inserted: action, source: source)
+    case .deletedAction(let action):
+      (delegate as? GraphActionDelegate)?.graph?(graph, deleted: action, source: source)
+    case .addedActionProperty(let action, let name, let value):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, added: name, with: value, source: source)
+    case .updatedActionProperty(let action, let name, let value):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, updated: name, with: value, source: source)
+    case .removedActionProperty(let action, let name, let value):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, removed: name, with: value, source: source)
+    case .addedActionTag(let action, let name):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, added: name, source: source)
+    case .removedActionTag(let action, let name):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, removed: name, source: source)
+    case .addedActionToGroup(let action, let name):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, addedTo: name, source: source)
+    case .removedActionFromGroup(let action, let name):
+      (delegate as? GraphActionDelegate)?.graph?(graph, action: action, removedFrom: name, source: source)
+    }
   }
 }

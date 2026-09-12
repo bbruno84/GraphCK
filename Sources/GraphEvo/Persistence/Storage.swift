@@ -66,6 +66,10 @@ extension Graph {
    executed when the save operation is completed.
    */
   public func async(_ completion: ((Bool, Error?) -> Void)? = nil) {
+    guard !isTransactionFacade else {
+      GraphCompletionCallback(success: false, error: GraphTransactionError.nestedTransaction, completion: completion)
+      return
+    }
     guard let moc = managedObjectContext else {
       GraphCompletionCallback(
         success: false,
@@ -77,6 +81,10 @@ extension Graph {
     moc.perform { [weak moc] in
       self.persistenceOperationLock.lock()
       defer { self.persistenceOperationLock.unlock() }
+      guard !self.isCloudPurgeInProgress else {
+        GraphCompletionCallback(success: false, error: GraphCloudPurgeError.writesBlockedDuringPurge, completion: completion)
+        return
+      }
       do {
         try moc?.save()
         GraphCompletionCallback(success: true, error: nil, completion: completion)
@@ -92,6 +100,10 @@ extension Graph {
    executed when the save operation is completed.
    */
   public func sync(_ completion: ((Bool, Error?) -> Void)? = nil) {
+    guard !isTransactionFacade else {
+      GraphCompletionCallback(success: false, error: GraphTransactionError.nestedTransaction, completion: completion)
+      return
+    }
     guard let moc = managedObjectContext else {
       GraphCompletionCallback(
         success: false,
@@ -100,16 +112,28 @@ extension Graph {
       return
     }
     
+    var success = false
+    var saveError: Error?
+
     persistenceOperationLock.lock()
-    defer { persistenceOperationLock.unlock() }
     moc.performAndWait { [unowned moc] in
+      guard !self.isCloudPurgeInProgress else {
+        saveError = GraphCloudPurgeError.writesBlockedDuringPurge
+        return
+      }
       do {
         try moc.save()
-        GraphCompletionCallback(success: true, error: nil, completion: completion)
+        success = true
       } catch let e as NSError {
-        GraphCompletionCallback(success: false, error: e, completion: completion)
+        saveError = e
       }
     }
+
+    // The completion may re-enter GraphEvo (for example, the migration
+    // coordinator records the final ledger state from here). Invoke it only
+    // after both the context operation and the persistence lock have ended.
+    persistenceOperationLock.unlock()
+    GraphCompletionCallback(success: success, error: saveError, completion: completion)
   }
   
   /**

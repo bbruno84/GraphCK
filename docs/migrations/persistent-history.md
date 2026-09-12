@@ -33,6 +33,21 @@ watchers; and save the new token only after delivery.
 
 ## Tokens
 
+### Persisted deletion replay
+
+Merging history and materializing events can fault rows that have already been
+deleted, including after a remote purge and a subsequent app launch. Core Data
+may then leave empty deletions pending in the view context. GraphEvo finalizes
+them only when every pending object is a deletion with an ID in the committed
+batch and no changed values. Inserts, updates, and unrelated deletions prevent
+this save; genuine user edits are never rolled back or implicitly committed.
+The same rule covers batch reports, history-gap delivery, legacy callbacks, and
+private Graph transactions. Regression tests assert that finalization adds no
+persistent-history transaction and leaves subsequent Graph transactions usable.
+This behavior is independent of application migrations and does not erase
+SQLite files or history tokens.
+
+
 The token is stored on disk at a store-associated path and also kept in a local
 backup. With `appGroupIdentifier`, the token path may reside in the App Group.
 

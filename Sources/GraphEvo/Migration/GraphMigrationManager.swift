@@ -12,33 +12,13 @@ import CoreData
 /// This becomes the official system for all future migrations.
 public final class GraphMigrationManager {
 
-    private struct PendingPhase {
-        let phase: GraphLifecyclePhase
-        let configuration: GraphStoreConfiguration?
-        let graph: Graph?
-        let completion: (() -> Void)?
-    }
-
-    private final class CompletionGate {
-        private let lock = NSLock()
-        private var consumed = false
-
-        func consume() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !consumed else { return false }
-            consumed = true
-            return true
-        }
-    }
-    
     public enum GraphLifecyclePhase {
         case preInit
         case postInit
         case postMigration
         case ready
     }
-    
+
     /// Default base folder where migrations can store their backups
     /// (e.g. SQLite stores, baseline.zip, etc.).
     ///
@@ -51,38 +31,26 @@ public final class GraphMigrationManager {
             .deletingLastPathComponent()
             .appendingPathComponent("migrationBackups", isDirectory: true)
     }
-    
+
     /// Stores lifecycle phase callbacks. The callback receives the store configuration and an optional Graph context.
     /// Some phases may not provide a Graph instance.
     private static var callbacks: [GraphLifecyclePhase: [(GraphStoreConfiguration?, Graph?) -> Void]] = [:]
 
     /// Stores all registered migrations in order.
     private static var migrations: [GraphMigration] = []
-    /// Tracks the current migration index for sequential execution.
-    private static var currentMigrationIndex: Int = 0
-    
-    /// Tracks active migrations that have been activated in .preInit phase.
-    private static var activeMigrations: Set<String> = []
-
-    /// Prevents terminal migration decisions from being repeated at every lifecycle phase.
-    private static var loggedTerminalDecisions: Set<String> = []
-
-    /// Shared context for the entire migration cycle.
-    private static var currentContext: GraphMigrationContext? = nil
-
     /// Serializes the process-wide migration state. The public API predates
     /// Swift concurrency, so a lock keeps registration and lifecycle calls
     /// safe without forcing an async source-breaking API change.
     private static let stateLock = NSRecursiveLock()
     /// A phase remains in flight until its migration completion is received.
     /// Later phases are queued instead of overwriting the active index/context.
-    private static var phaseInFlight = false
-    private static var inFlightPhase: GraphLifecyclePhase?
-    private static var inFlightCompletion: (() -> Void)?
-    private static var pendingPhases: [PendingPhase] = []
-    private static var stateGeneration = 0
+    private static var coordinators: [GraphStoreScope: StoreMigrationCoordinator] = [:]
+    private static var observedStores: [GraphStoreScope: (configuration: GraphStoreConfiguration, count: Int)] = [:]
+    private static var kvsObserver: NSObjectProtocol?
 
 #if DEBUG
+    internal static var coordinatorCountForTesting: Int { stateLock.lock(); defer { stateLock.unlock() }; return coordinators.count }
+    internal static var observedStoreCountForTesting: Int { stateLock.lock(); defer { stateLock.unlock() }; return observedStores.count }
     /// Resets process-wide migration state for isolated test cases.
     ///
     /// Applications should register migrations once during startup and must not
@@ -93,15 +61,12 @@ public final class GraphMigrationManager {
         defer { stateLock.unlock() }
         callbacks.removeAll()
         migrations.removeAll()
-        currentMigrationIndex = 0
-        activeMigrations.removeAll()
-        loggedTerminalDecisions.removeAll()
-        currentContext = nil
-        phaseInFlight = false
-        inFlightPhase = nil
-        inFlightCompletion = nil
-        pendingPhases.removeAll()
-        stateGeneration &+= 1
+        coordinators.removeAll()
+        observedStores.removeAll()
+        if let kvsObserver { NotificationCenter.default.removeObserver(kvsObserver) }
+        kvsObserver = nil
+        GraphMigrationLedger.resetKVSStoreForTesting()
+        GraphMigrationLedger.setFaultForTesting(nil)
     }
 #endif
 
@@ -109,7 +74,68 @@ public final class GraphMigrationManager {
         for migration: GraphMigration,
         configuration: GraphStoreConfiguration
     ) -> GraphMigrationRecord? {
-        GraphMigrationLedger.reconciledRecord(
+        do { return try recordThrowing(for: migration, configuration: configuration) }
+        catch {
+            GraphMigrationLogger.log(migrationID: migration.id, level: .error, event: "migration_record_read_failed", message: error.localizedDescription, configuration: configuration)
+            return nil
+        }
+    }
+
+    /// Returns the current record and propagates ledger or configuration errors.
+    public static func recordThrowing(
+        for migration: GraphMigration,
+        configuration: GraphStoreConfiguration
+    ) throws -> GraphMigrationRecord? {
+        let resolvedConfiguration: GraphStoreConfiguration
+        resolvedConfiguration = try normalizedConfigurationThrowing(configuration)
+        return try GraphMigrationLedger.reconciledRecordThrowing(
+            migrationID: migration.id,
+            version: migration.version,
+            synchronization: migration.completionSynchronization,
+            configuration: resolvedConfiguration
+        )
+    }
+
+    /// Adopts a completion recorded by a pre-ledger application marker.
+    ///
+    /// This is intentionally separate from `notRequired`: the migration did
+    /// run in the past, so the legacy migration identity must remain visible
+    /// to later migrations (for example a CloudKit replay). The operation is
+    /// idempotent and does not rewrite an existing completed record.
+    public static func adoptLegacyCompletion(
+        _ migration: GraphMigration,
+        configuration: GraphStoreConfiguration,
+        reason: String = "legacy compatibility bootstrap"
+    ) throws {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        if try recordThrowing(for: migration, configuration: configuration)?.state == .done {
+            return
+        }
+        _ = try GraphMigrationLedger.markDone(
+            migrationID: migration.id,
+            version: migration.version,
+            synchronization: migration.completionSynchronization,
+            configuration: configuration,
+            phase: "compatibilityBootstrap",
+            operationID: "legacy-adoption-\(migration.id)",
+            requestedBy: .recovery,
+            now: Date()
+        )
+        GraphMigrationLogger.log(
+            migrationID: migration.id,
+            level: .info,
+            event: "legacy_completion_adopted",
+            message: reason,
+            configuration: configuration
+        )
+    }
+
+    public static func resetRecord(
+        for migration: GraphMigration,
+        configuration: GraphStoreConfiguration
+    ) throws {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        try GraphMigrationLedger.reset(
             migrationID: migration.id,
             version: migration.version,
             synchronization: migration.completionSynchronization,
@@ -119,13 +145,62 @@ public final class GraphMigrationManager {
 
     public static func resetRecord(
         for migration: GraphMigration,
-        configuration: GraphStoreConfiguration
+        configuration: GraphStoreConfiguration,
+        targets: [GraphMigrationResetTarget],
+        requestedBy: GraphMigrationRequestedBy,
+        reason: String
     ) throws {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        try GraphMigrationLedger.reset(
+            migrationID: migration.id,
+            version: migration.version,
+            configuration: configuration,
+            targets: Set(targets),
+            requestedBy: requestedBy,
+            reason: reason
+        )
+    }
+
+    /// Resets the local and/or shared completion projection without deleting
+    /// the append-only ledger history.
+    public static func resetRecord(
+        for migration: GraphMigration,
+        configuration: GraphStoreConfiguration,
+        target: GraphMigrationResetTarget
+    ) throws {
+        let configuration = try normalizedConfigurationThrowing(configuration)
         try GraphMigrationLedger.reset(
             migrationID: migration.id,
             version: migration.version,
             synchronization: migration.completionSynchronization,
-            configuration: configuration
+            configuration: configuration,
+            target: target
+        )
+    }
+
+    /// Queues a one-shot local force request. The request is consumed when the
+    /// next attempt for this store starts and is never published to KVS.
+    public static func forceMigration(
+        _ migration: GraphMigration,
+        configuration: GraphStoreConfiguration,
+        reason: String = "manual force"
+    ) throws {
+        try forceMigration(migration, configuration: configuration, requestedBy: .user, reason: reason)
+    }
+
+    public static func forceMigration(
+        _ migration: GraphMigration,
+        configuration: GraphStoreConfiguration,
+        requestedBy: GraphMigrationRequestedBy,
+        reason: String
+    ) throws {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        try GraphMigrationLedger.requestForce(
+            migrationID: migration.id,
+            version: migration.version,
+            configuration: configuration,
+            requestedBy: requestedBy,
+            reason: reason
         )
     }
 
@@ -149,12 +224,117 @@ public final class GraphMigrationManager {
         guard !migrations.contains(where: { $0.id == migration.id }) else { return }
         migrations.append(migration)
     }
-    
+
     /// Registers multiple migrations to be executed at lifecycle phases.
     public static func registerMigrations(_ migrations: [GraphMigration]) {
         migrations.forEach { registerMigration($0) }
     }
-    
+
+    static func registeredMigrationsSnapshot() -> [GraphMigration] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return migrations
+    }
+
+    static func callbacksSnapshot(for phase: GraphLifecyclePhase) -> [(GraphStoreConfiguration?, Graph?) -> Void] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return callbacks[phase] ?? []
+    }
+
+    static func discardCoordinator(_ coordinator: StoreMigrationCoordinator) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if coordinators[coordinator.scope] === coordinator {
+            coordinators.removeValue(forKey: coordinator.scope)
+        }
+    }
+
+    static func registerKVSObservation(configuration: GraphStoreConfiguration) {
+        let resolvedConfiguration: GraphStoreConfiguration
+        do { resolvedConfiguration = try normalizedConfigurationThrowing(configuration) }
+        catch {
+            GraphMigrationLogger.log(migrationID: "GraphMigrationManager", level: .error, event: "migration_kvs_observer_configuration_failed", message: error.localizedDescription, configuration: configuration)
+            return
+        }
+        let scope = GraphStoreScope(configuration: resolvedConfiguration)
+        stateLock.lock()
+        let current = observedStores[scope]
+        observedStores[scope] = (resolvedConfiguration, (current?.count ?? 0) + 1)
+        if kvsObserver == nil {
+            let observation = GraphMigrationLedger.kvsObservation
+            kvsObserver = NotificationCenter.default.addObserver(forName: observation.name, object: observation.object, queue: nil) { _ in
+                reconcileObservedStores()
+            }
+        }
+        stateLock.unlock()
+        GraphMigrationLedger.synchronizeKVS()
+        reconcileObservedStores()
+    }
+
+    static func unregisterKVSObservation(configuration: GraphStoreConfiguration) {
+        let scope = GraphStoreScope(configuration: normalizedConfiguration(configuration))
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard let current = observedStores[scope] else { return }
+        if current.count > 1 { observedStores[scope] = (current.configuration, current.count - 1) }
+        else { observedStores.removeValue(forKey: scope) }
+        if observedStores.isEmpty, let kvsObserver { NotificationCenter.default.removeObserver(kvsObserver); self.kvsObserver = nil }
+    }
+
+    private static func reconcileObservedStores() {
+        stateLock.lock(); let stores = observedStores.values.map(\.configuration); let migrations = self.migrations; stateLock.unlock()
+        for configuration in stores {
+            for migration in migrations where migration.completionSynchronization == .localAndICloudKeyValueStore {
+                do {
+                    try GraphMigrationLedger.reconcileRemoteObservation(
+                        migrationID: migration.id,
+                        version: migration.version,
+                        synchronization: migration.completionSynchronization,
+                        configuration: configuration
+                    )
+                } catch {
+                    GraphMigrationLogger.log(
+                        migrationID: migration.id,
+                        level: .error,
+                        event: "migration_kvs_observation_failed",
+                        message: error.localizedDescription,
+                        configuration: configuration
+                    )
+                }
+            }
+        }
+    }
+
+    public static func history(
+        for migration: GraphMigration,
+        configuration: GraphStoreConfiguration
+    ) throws -> [GraphMigrationLedgerEntry] {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        return try GraphMigrationLedger.history(
+            migrationID: migration.id,
+            version: migration.version,
+            configuration: configuration
+        )
+    }
+
+    public static func stateSnapshot(
+        for migration: GraphMigration,
+        configuration: GraphStoreConfiguration
+    ) throws -> GraphMigrationStateSnapshot {
+        let configuration = try normalizedConfigurationThrowing(configuration)
+        return try GraphMigrationLedger.stateSnapshot(
+            migrationID: migration.id,
+            version: migration.version,
+            configuration: configuration
+        )
+    }
+
+    static func normalizedConfiguration(_ configuration: GraphStoreConfiguration) -> GraphStoreConfiguration {
+        (try? normalizedConfigurationThrowing(configuration)) ?? configuration
+    }
+
+    static func normalizedConfigurationThrowing(_ configuration: GraphStoreConfiguration) throws -> GraphStoreConfiguration {
+        try configuration.resolvingEnvironment()
+    }
+
     /// Executes all callbacks and registered migrations for the specified lifecycle phase, running migrations in sequence.
     /// - Parameters:
     ///   - phase: The lifecycle phase being handled.
@@ -174,170 +354,35 @@ public final class GraphMigrationManager {
         graph: Graph?,
         completion: (() -> Void)?
     ) {
+        handlePhaseResult(phase, configuration: configuration, graph: graph) { _ in completion?() }
+    }
+
+    /// Runs a phase and reports migration/ledger failures rather than treating
+    /// completion as proof of success. Existing completion-only callers retain
+    /// their diagnostic-only failure behavior.
+    public static func handlePhaseResult(
+        _ phase: GraphLifecyclePhase,
+        configuration: GraphStoreConfiguration?,
+        graph: Graph?,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let inputConfiguration = configuration else {
+            completion(.failure(NSError(domain: "GraphEvo.Migration", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Missing migration configuration."])))
+            return
+        }
+        let configuration = normalizedConfiguration(inputConfiguration)
+        let scope = GraphStoreScope(configuration: configuration)
         stateLock.lock()
-        defer { stateLock.unlock() }
-
-        if phaseInFlight {
-            pendingPhases.append(PendingPhase(
-                phase: phase,
-                configuration: configuration,
-                graph: graph,
-                completion: completion
-            ))
-            return
-        }
-        phaseInFlight = true
-        inFlightPhase = phase
-        inFlightCompletion = completion
-        startPhase(phase, configuration: configuration, graph: graph)
+        let coordinator = coordinators[scope] ?? {
+            let value = StoreMigrationCoordinator(scope: scope)
+            coordinators[scope] = value
+            return value
+        }()
+        stateLock.unlock()
+        coordinator.handle(phase, configuration: configuration, graph: graph, completion: completion)
     }
 
-    /// Starts a phase while `stateLock` is held. The lock is recursive so
-    /// legacy callbacks can safely register more work or enqueue another
-    /// lifecycle phase synchronously.
-    private static func startPhase(_ phase: GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?) {
-        // Post notification for phase change
-        postPhaseNotification(phase: phase, configuration: configuration, graph: graph)
-        GraphMigrationLogger.log(
-            migrationID: "GraphMigrationManager",
-            phase: phase,
-            level: .info,
-            event: "lifecycle_phase_entered",
-            message: "Graph lifecycle phase entered; no migration has started yet",
-            metadata: ["graphID": graph?.name ?? ""],
-            configuration: configuration
-        )
-        // Fire callbacks
-        callbacks[phase]?.forEach { $0(configuration, graph) }
-        // Reset migration index for every phase
-        currentMigrationIndex = 0
-        // Use existing context if present, otherwise create new one
-        if currentContext == nil {
-            currentContext = GraphMigrationContext()
-        }
-        runNextMigration(for: phase, configuration: configuration, graph: graph, context: currentContext)
-    }
-
-    /// Runs the next migration in sequence for the given phase.
-    private static func runNextMigration(for phase: GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?, context: GraphMigrationContext? = nil) {
-        guard currentMigrationIndex < migrations.count else {
-            finishPhaseIfNeeded()
-            return
-        }
-        let migration = migrations[currentMigrationIndex]
-
-        let isActive = activeMigrations.contains(migration.id)
-        var mutableContext = context
-
-        if !isActive, let configuration {
-            let localRecord = GraphMigrationLedger.localRecord(
-                migrationID: migration.id,
-                version: migration.version,
-                configuration: configuration
-            )
-            let previousRecord = record(for: migration, configuration: configuration)
-            if let previousRecord {
-                mutableContext?.set("GraphMigration.previousRecord", value: previousRecord)
-            }
-
-            if let previousRecord, previousRecord.state == .done {
-                let source = localRecord?.state == .done ? "local_ledger" : "icloud_kvs"
-                logTerminalDecisionOnce(
-                    migration: migration,
-                    phase: phase,
-                    reason: "ledger_done",
-                    source: source,
-                    record: previousRecord,
-                    configuration: configuration
-                )
-                advanceToNextMigration(for: phase, configuration: configuration, graph: graph, context: mutableContext)
-                return
-            }
-
-            if migration.recognizesLegacyCompletion(at: phase, configuration: configuration, graph: graph) {
-                persistDone(
-                    for: migration,
-                    configuration: configuration,
-                    event: "legacy_completion_adopted"
-                )
-                advanceToNextMigration(for: phase, configuration: configuration, graph: graph, context: mutableContext)
-                return
-            }
-        }
-
-        let needsRun = migration.needsRun(at: phase, configuration: configuration, graph: graph, context: &mutableContext)
-        currentContext = mutableContext
-
-        if !isActive && !needsRun {
-            advanceToNextMigration(for: phase, configuration: configuration, graph: graph, context: mutableContext)
-            return
-        }
-
-        if !isActive, needsRun, let configuration {
-            persistStarted(for: migration, configuration: configuration)
-            if phase == .preInit {
-                activeMigrations.insert(migration.id)
-            }
-        }
-
-        let completionGate = CompletionGate()
-        let generation = stateGeneration
-        migration.handlePhase(phase, configuration: configuration, graph: graph, context: mutableContext) { result in
-            guard completionGate.consume() else { return }
-            stateLock.lock()
-            defer { stateLock.unlock() }
-            guard generation == stateGeneration else { return }
-            switch result {
-            case .done, .fallback:
-                let completesMigration = phase == .ready || !activeMigrations.contains(migration.id)
-                if completesMigration, let configuration {
-                    persistDone(for: migration, configuration: configuration)
-                }
-                if phase == .ready {
-                    activeMigrations.remove(migration.id)
-                }
-                advanceToNextMigration(for: phase, configuration: configuration, graph: graph, context: mutableContext)
-            case .skipped:
-                if let configuration {
-                    clearStartedRecord(for: migration, configuration: configuration)
-                }
-                activeMigrations.remove(migration.id)
-                advanceToNextMigration(for: phase, configuration: configuration, graph: graph, context: mutableContext)
-            case .error(let error):
-                if let configuration {
-                    persistFailed(for: migration, error: error, configuration: configuration)
-                }
-                // Log error and stop further migrations
-                GraphMigrationLogger.log(
-                    migrationID: migration.id,
-                    phase: phase,
-                    level: .error,
-                    event: "migration_failed",
-                    message: error.localizedDescription,
-                    metadata: ["graphID": graph?.name ?? ""],
-                    configuration: configuration
-                )
-                postFailureNotification(
-                    migrationID: migration.id,
-                    phase: phase,
-                    configuration: configuration,
-                    graph: graph,
-                    error: error
-                )
-                graph?.emit(.error(.migration(
-                    migrationID: migration.id,
-                    phase: String(describing: phase),
-                    underlying: error
-                )))
-                activeMigrations.remove(migration.id)
-                finishPhaseIfNeeded()
-            }
-        }
-
-        // A migration may complete synchronously, in which case the recursive
-        // calls above already advanced or finished the phase. An asynchronous
-        // migration leaves phaseInFlight set until its completion arrives.
-    }
 }
 
 // MARK: - Notifications
@@ -346,166 +391,10 @@ public extension Notification.Name {
     static let migrationPhaseDidChange = Notification.Name("GraphMigrationManager.migrationPhaseDidChange")
     /// Notification posted when a migration fails.
     static let graphMigrationDidFail = Notification.Name("GraphMigrationManager.graphMigrationDidFail")
-    
+
 }
 
-private extension GraphMigrationManager {
-    static func advanceToNextMigration(
-        for phase: GraphLifecyclePhase,
-        configuration: GraphStoreConfiguration?,
-        graph: Graph?,
-        context: GraphMigrationContext?
-    ) {
-        currentMigrationIndex += 1
-        if currentMigrationIndex < migrations.count {
-            runNextMigration(for: phase, configuration: configuration, graph: graph, context: context)
-        } else {
-            finishPhaseIfNeeded()
-        }
-    }
-
-    static func finishPhaseIfNeeded() {
-        guard phaseInFlight else { return }
-        phaseInFlight = false
-        if inFlightPhase == .ready {
-            currentContext = nil
-        }
-        inFlightPhase = nil
-        let completion = inFlightCompletion
-        inFlightCompletion = nil
-        if !pendingPhases.isEmpty {
-            let next = pendingPhases.removeFirst()
-            phaseInFlight = true
-            inFlightPhase = next.phase
-            inFlightCompletion = next.completion
-            startPhase(next.phase, configuration: next.configuration, graph: next.graph)
-        }
-        // Invoke the completion after the next queued phase has been admitted,
-        // so a chained phase cannot overtake work already waiting in the queue.
-        completion?()
-    }
-
-    static func persistStarted(for migration: GraphMigration, configuration: GraphStoreConfiguration) {
-        do {
-            _ = try GraphMigrationLedger.markStarted(
-                migrationID: migration.id,
-                version: migration.version,
-                configuration: configuration
-            )
-            logLedgerEvent("migration_started", migration: migration, configuration: configuration)
-        } catch {
-            logLedgerError(error, event: "migration_started_write_failed", migration: migration, configuration: configuration)
-        }
-    }
-
-    static func persistDone(
-        for migration: GraphMigration,
-        configuration: GraphStoreConfiguration,
-        event: String = "migration_done"
-    ) {
-        do {
-            _ = try GraphMigrationLedger.markDone(
-                migrationID: migration.id,
-                version: migration.version,
-                synchronization: migration.completionSynchronization,
-                configuration: configuration
-            )
-            logLedgerEvent(event, migration: migration, configuration: configuration)
-        } catch {
-            logLedgerError(error, event: "migration_done_write_failed", migration: migration, configuration: configuration)
-        }
-    }
-
-    static func persistFailed(
-        for migration: GraphMigration,
-        error: Error,
-        configuration: GraphStoreConfiguration
-    ) {
-        do {
-            _ = try GraphMigrationLedger.markFailed(
-                migrationID: migration.id,
-                version: migration.version,
-                error: error,
-                configuration: configuration
-            )
-            logLedgerEvent("migration_failed", migration: migration, configuration: configuration)
-        } catch {
-            logLedgerError(error, event: "migration_failed_write_failed", migration: migration, configuration: configuration)
-        }
-    }
-
-    static func clearStartedRecord(for migration: GraphMigration, configuration: GraphStoreConfiguration) {
-        do {
-            try GraphMigrationLedger.clearLocal(
-                migrationID: migration.id,
-                version: migration.version,
-                configuration: configuration
-            )
-            logLedgerEvent("migration_skipped", migration: migration, configuration: configuration)
-        } catch {
-            logLedgerError(error, event: "migration_skipped_clear_failed", migration: migration, configuration: configuration)
-        }
-    }
-
-    static func logLedgerEvent(
-        _ event: String,
-        migration: GraphMigration,
-        configuration: GraphStoreConfiguration
-    ) {
-        GraphMigrationLogger.log(
-            migrationID: migration.id,
-            level: .info,
-            event: event,
-            message: "Migration ledger updated",
-            metadata: ["version": String(migration.version)],
-            configuration: configuration
-        )
-    }
-
-    static func logLedgerError(
-        _ error: Error,
-        event: String,
-        migration: GraphMigration,
-        configuration: GraphStoreConfiguration
-    ) {
-        GraphMigrationLogger.log(
-            migrationID: migration.id,
-            level: .error,
-            event: event,
-            message: error.localizedDescription,
-            metadata: ["version": String(migration.version)],
-            configuration: configuration
-        )
-    }
-
-    static func logTerminalDecisionOnce(
-        migration: GraphMigration,
-        phase: GraphLifecyclePhase,
-        reason: String,
-        source: String,
-        record: GraphMigrationRecord,
-        configuration: GraphStoreConfiguration
-    ) {
-        let key = "\(migration.id)-v\(migration.version)-\(reason)"
-        guard loggedTerminalDecisions.insert(key).inserted else { return }
-
-        GraphMigrationLogger.log(
-            migrationID: migration.id,
-            phase: phase,
-            level: .info,
-            event: "migration_not_started",
-            message: "Migration will not start because completion is already recorded",
-            metadata: [
-                "reason": reason,
-                "source": source,
-                "state": record.state.rawValue,
-                "version": String(record.version),
-                "updatedAt": ISO8601DateFormatter().string(from: record.updatedAt)
-            ],
-            configuration: configuration
-        )
-    }
-
+extension GraphMigrationManager {
     /// Posts a notification for migration phase changes.
     static func postPhaseNotification(phase: GraphLifecyclePhase, configuration: GraphStoreConfiguration?, graph: Graph?) {
         let userInfo: [String: Any] = [
@@ -547,11 +436,16 @@ private extension GraphMigrationManager {
 extension GraphMigrationManager {
     /// Handles remote entity changes from Persistent History by notifying all registered migrations.
     public static func handleRemoteEntityChanges(configuration: GraphStoreConfiguration?, graph: Graph?, inserted: [NSManagedObjectID], updated: [NSManagedObjectID], context: GraphMigrationContext? = nil) {
+        guard let inputConfiguration = configuration else { return }
+        let configuration = normalizedConfiguration(inputConfiguration)
+        let scope = GraphStoreScope(configuration: configuration)
         stateLock.lock()
-        defer { stateLock.unlock() }
-        let ctx = context ?? currentContext ?? GraphMigrationContext()
-        for migration in migrations {
-            migration.handleRemoteChanges(configuration: configuration, graph: graph, context: ctx, inserted: inserted, updated: updated)
-        }
+        let coordinator = coordinators[scope] ?? {
+            let value = StoreMigrationCoordinator(scope: scope)
+            coordinators[scope] = value
+            return value
+        }()
+        stateLock.unlock()
+        coordinator.handleRemoteChanges(configuration: configuration, graph: graph, context: context, inserted: inserted, updated: updated)
     }
 }

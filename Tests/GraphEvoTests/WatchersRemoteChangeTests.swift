@@ -54,6 +54,83 @@ final class WatchersRemoteChangeTests: XCTestCase {
             .first { $0.name == name }
     }
 
+    func testRelatedEntityInsertionReachesAllLegacyWatchers() {
+        final class Delegate: NSObject, GraphEntityDelegate {
+            var onInsert: ((Entity) -> Void)?
+
+            func graph(_ graph: Graph, inserted entity: Entity, source: GraphSource) {
+                guard source == .local else { return }
+                onInsert?(entity)
+            }
+        }
+
+        var config = GraphStoreConfiguration()
+        config.name = "RelatedEntityLegacyWatchers"
+        let graph = Graph(configuration: config)
+        let delegate = Delegate()
+        let firstReceived = expectation(description: "first related entity watcher")
+        let secondReceived = expectation(description: "second related entity watcher")
+        delegate.onInsert = { entity in
+            if entity.type == "First" { firstReceived.fulfill() }
+            if entity.type == "Second" { secondReceived.fulfill() }
+        }
+
+        let firstWatcher = Watch<Entity>(graph: graph).where(.type("First"))
+        firstWatcher.delegate = delegate
+        let secondWatcher = Watch<Entity>(graph: graph).where(.type("Second"))
+        secondWatcher.delegate = delegate
+
+        let first = Entity("First", graph: graph)
+        let second = Entity("Second", graph: graph)
+        _ = first.is(relationship: "relatesTo").of(second)
+        graph.sync()
+
+        wait(for: [firstReceived, secondReceived], timeout: 2)
+        withExtendedLifetime((firstWatcher, secondWatcher)) {}
+    }
+
+    func testEntityAndRelationshipWatchersBothReceiveRelatedInsertion() {
+        final class EntityDelegate: NSObject, GraphEntityDelegate {
+            func graph(_ graph: Graph, inserted entity: Entity, source: GraphSource) {
+                if source == .local { onInsert?() }
+            }
+
+            var onInsert: (() -> Void)?
+        }
+
+        final class RelationshipDelegate: NSObject, GraphRelationshipDelegate {
+            func graph(_ graph: Graph, inserted relationship: Relationship, source: GraphSource) {
+                if source == .local { onInsert?() }
+            }
+
+            var onInsert: (() -> Void)?
+        }
+
+        var config = GraphStoreConfiguration()
+        config.name = "RelatedEntityAndRelationshipWatchers"
+        let graph = Graph(configuration: config)
+        let entityDelegate = EntityDelegate()
+        let relationshipDelegate = RelationshipDelegate()
+        let entityReceived = expectation(description: "entity watcher")
+        let relationshipReceived = expectation(description: "relationship watcher")
+        entityDelegate.onInsert = { entityReceived.fulfill() }
+        relationshipDelegate.onInsert = { relationshipReceived.fulfill() }
+
+        let entityWatcher = Watch<Entity>(graph: graph).where(.type("Inserted"))
+        entityWatcher.delegate = entityDelegate
+        let relationshipWatcher = Watch<Relationship>(graph: graph).where(.type("relatesTo"))
+        relationshipWatcher.delegate = relationshipDelegate
+
+        let existing = Entity("Existing", graph: graph)
+        graph.sync()
+        let inserted = Entity("Inserted", graph: graph)
+        _ = inserted.is(relationship: "relatesTo").of(existing)
+        graph.sync()
+
+        wait(for: [entityReceived, relationshipReceived], timeout: 2)
+        withExtendedLifetime((entityWatcher, relationshipWatcher)) {}
+    }
+
     func testEntityInsertTriggersWatcherDelegateWithSourceLocal() {
         let saveExpectation = expectation(description: "Save should succeed")
         let delegateExpectation = expectation(description: "Watcher should notify delegate")
