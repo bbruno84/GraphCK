@@ -146,6 +146,11 @@ transactions to avoid duplicate callbacks on the originating device.
 
 ## Migrations
 
+`waitsForApplicationMigrations` is an opt-in bootstrap/readiness gate. Preserve
+its default `false` behavior when modifying lifecycle code. `graph.transaction`
+offers public Node APIs on a scoped private context; do not escape the facade,
+perform external writes inside its body, or mistake it for a CloudKit pause.
+
 Register migrations before creating or opening a graph:
 
 ```swift
